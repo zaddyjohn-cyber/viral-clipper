@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Viral Clipper</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- ───────── sidebar ───────── -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="m13 2-3 7h5l-3 7"/><circle cx="7" cy="18" r="2.4"/><path d="M9.2 16.6 17 5"/>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <strong>Viral Clipper</strong>
+        <span>AI clip finder</span>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <button class="nav-item is-active" data-view="create">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+        New clip run
+      </button>
+      <button class="nav-item" data-view="library">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M10 9.5v5l4-2.5z"/></svg>
+        Results
+        <span class="nav-badge" id="navBadge" hidden>0</span>
+      </button>
+      <button class="nav-item" data-view="settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.6 1.6 0 0 0 .33 1.76l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.6 1.6 0 0 0 15 19.4a1.6 1.6 0 0 0-1 1.47V21a2 2 0 1 1-4 0v-.06A1.6 1.6 0 0 0 9 19.4a1.6 1.6 0 0 0-1.76.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.6 1.6 0 0 0 4.6 15a1.6 1.6 0 0 0-1.47-1H3a2 2 0 1 1 0-4h.06A1.6 1.6 0 0 0 4.6 9a1.6 1.6 0 0 0-.33-1.76l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.6 1.6 0 0 0 9 4.6 1.6 1.6 0 0 0 10 3.13V3a2 2 0 1 1 4 0v.06A1.6 1.6 0 0 0 15 4.6a1.6 1.6 0 0 0 1.76-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.6 1.6 0 0 0 19.4 9v0a1.6 1.6 0 0 0 1.47 1H21a2 2 0 1 1 0 4h-.06a1.6 1.6 0 0 0-1.54 1z"/></svg>
+        Settings
+      </button>
+    </nav>
+
+    <button class="runpill" id="runPill" hidden>
+      <div class="runpill-top">
+        <span class="runpill-dot"></span>
+        <span id="runPillStage">Downloading</span>
+        <b id="runPillPct">0%</b>
+      </div>
+      <div class="bar"><b id="runPillBar"></b></div>
+      <span class="runpill-msg" id="runPillMsg">Working</span>
+    </button>
+
+    <div class="sidebar-foot">
+      <div class="health" id="health">
+        <div class="health-row" data-k="ffmpeg"><i></i><span>ffmpeg</span></div>
+        <div class="health-row" data-k="yt_dlp"><i></i><span>yt-dlp</span></div>
+        <div class="health-row" data-k="api_key"><i></i><span>API key</span></div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ───────── main ───────── -->
+  <main class="main">
+
+    <!-- CREATE -->
+    <section class="view is-active" data-view="create">
+      <div class="hero">
+        <span class="eyebrow">Paste and go</span>
+        <h1>Find the moments<br>worth clipping.</h1>
+        <p class="hero-sub">Drop in any video link. Every spoken moment gets read, scored for
+          viral potential, and cut into ready to post shorts.</p>
+
+        <form class="urlbar" id="urlForm" autocomplete="off">
+          <svg class="urlbar-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.8 1.8"/>
+            <path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.8-1.8"/>
+          </svg>
+          <input id="urlInput" type="text" placeholder="https://youtube.com/watch?v=..." spellcheck="false">
+          <button class="btn btn-accent" type="submit" id="goBtn">
+            Find clips
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h13M13 6l6 6-6 6"/></svg>
+          </button>
+        </form>
+
+        <div class="platforms">
+          <span>Works with</span>
+          <b>YouTube</b><b>Facebook</b><b>X</b><b>Instagram</b><b>TikTok</b><b>Reddit</b><b>Twitch</b><b>Vimeo</b>
+        </div>
+      </div>
+
+      <div class="how">
+        <div class="how-card">
+          <div class="how-num">1</div>
+          <h4>Pull the video</h4>
+          <p>Downloads at 720p, public links or your own logged in content.</p>
+        </div>
+        <div class="how-card">
+          <div class="how-num">2</div>
+          <h4>Read every word</h4>
+          <p>Whisper transcribes the whole thing with timestamps, on your machine.</p>
+        </div>
+        <div class="how-card">
+          <div class="how-num">3</div>
+          <h4>Score the moments</h4>
+          <p>Claude rates each window on hook strength, payoff and standalone clarity.</p>
+        </div>
+        <div class="how-card">
+          <div class="how-num">4</div>
+          <h4>Cut and post</h4>
+          <p>Exports vertical 1080x1920 with a blurred fill, named by score.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- PROCESSING -->
+    <section class="view" data-view="processing">
+      <div class="proc">
+        <div class="proc-head">
+          <div class="spinner"><span></span><span></span><span></span></div>
+          <h2 id="procTitle">Working on your video</h2>
+          <p id="procMsg">Starting</p>
+        </div>
+
+        <ol class="steps" id="steps">
+          <li data-stage="download"><i></i>
+            <div><strong>Download</strong><span>Pulling the source video</span>
+              <div class="bar"><b></b></div></div><u></u></li>
+          <li data-stage="transcribe"><i></i>
+            <div><strong>Transcribe</strong><span>Reading every spoken word</span>
+              <div class="bar"><b></b></div></div><u></u></li>
+          <li data-stage="score"><i></i>
+            <div><strong>Score</strong><span>Rating each moment for reach</span>
+              <div class="bar"><b></b></div></div><u></u></li>
+          <li data-stage="ready"><i></i>
+            <div><strong>Done</strong><span>Clips ready to review</span>
+              <div class="bar"><b></b></div></div><u></u></li>
+        </ol>
+
+        <div class="proc-foot">
+          <span id="procElapsed">0:00 elapsed</span>
+          <button class="btn btn-danger btn-sm" id="cancelBtn">Stop this run</button>
+        </div>
+
+        <p class="proc-note">Transcribing is the slow step and it runs on your CPU.
+          You can move around the app or close this tab without losing the run.</p>
+      </div>
+    </section>
+
+    <!-- RESULTS -->
+    <section class="view" data-view="library">
+      <div class="empty" id="resultsEmpty">
+        <div class="empty-mark">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M10 9.5v5l4-2.5z"/></svg>
+        </div>
+        <h3>No clips yet</h3>
+        <p>Run a video through and the scored moments land here.</p>
+        <button class="btn" data-view="create">Start a run</button>
+      </div>
+
+      <div id="resultsWrap" hidden>
+        <header class="vidhead">
+          <div class="vidhead-main">
+            <span class="chip" id="vidPlatform">YouTube</span>
+            <h2 id="vidTitle">Video title</h2>
+            <p id="vidMeta">uploader</p>
+          </div>
+          <div class="vidhead-actions">
+            <button class="btn btn-ghost" id="revealBtn">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7.5A1.5 1.5 0 0 1 5.5 6h3.8a1.5 1.5 0 0 1 1.2.6l.9 1.2a1.5 1.5 0 0 0 1.2.6h4.9A1.5 1.5 0 0 1 19 9.9V17a1.5 1.5 0 0 1-1.5 1.5h-12A1.5 1.5 0 0 1 4 17z"/></svg>
+              Open folder
+            </button>
+            <button class="btn" id="newRunBtn">New run</button>
+          </div>
+        </header>
+
+        <div class="stats" id="stats"></div>
+
+        <div class="toolbar">
+          <div class="toolbar-left">
+            <button class="btn btn-ghost btn-sm" id="selectAllBtn">Select all</button>
+            <button class="btn btn-ghost btn-sm" id="selectNoneBtn">Clear</button>
+            <span class="toolbar-count" id="selCount">0 selected</span>
+          </div>
+          <button class="btn btn-accent" id="exportBtn" disabled>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v10M7.5 10 12 14.5 16.5 10M5 19h14"/></svg>
+            Export selected
+          </button>
+        </div>
+
+        <div class="grid" id="clipGrid"></div>
+      </div>
+    </section>
+
+    <!-- SETTINGS -->
+    <section class="view" data-view="settings">
+      <div class="panel-head">
+        <h2>Settings</h2>
+        <p>Stored on this machine at <code>~/.viral_clipper.json</code></p>
+      </div>
+
+      <form class="settings" id="settingsForm">
+        <div class="card">
+          <div class="card-head"><h3>Scoring engine</h3><p>The model that reads the transcript and rates each moment. Keys are saved per provider, so you can switch back and forth.</p></div>
+          <div class="providers" id="providers"></div>
+          <label class="field">
+            <span>API key for <b id="provName">Claude</b></span>
+            <input type="password" id="apiKey" placeholder="sk-..." autocomplete="off">
+            <small id="keyState">Not set</small>
+          </label>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h3>Clipping</h3><p>How the moments get picked and cut.</p></div>
+          <div class="field-row">
+            <label class="field">
+              <span>Target clip length</span>
+              <select id="clipLen">
+                <option value="30">30 seconds</option>
+                <option value="45">45 seconds</option>
+                <option value="60">60 seconds</option>
+                <option value="75">75 seconds</option>
+                <option value="90">90 seconds</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Max clips per video</span>
+              <select id="maxClips">
+                <option value="3">3</option><option value="4">4</option>
+                <option value="5">5</option><option value="6">6</option>
+                <option value="8">8</option><option value="10">10</option>
+              </select>
+            </label>
+          </div>
+          <div class="field-row">
+            <label class="field">
+              <span>Cookies from browser</span>
+              <select id="cookies">
+                <option value="none">None, public videos only</option>
+                <option value="chrome">Chrome</option>
+                <option value="edge">Edge</option>
+                <option value="firefox">Firefox</option>
+                <option value="brave">Brave</option>
+              </select>
+            </label>
+          </div>
+          <label class="field">
+            <span>Or a cookies.txt file</span>
+            <input type="text" id="cookiesFile" spellcheck="false"
+                   placeholder="C:\path	o\cookies.txt">
+            <small>Needed for videos that refuse to download, and the only option
+              that works on a server with no browser. Export one with a
+              "Get cookies.txt" browser extension. Takes priority over the dropdown.</small>
+          </label>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h3>Transcription</h3><p>Reads the spoken words. This is the slowest stage, so it decides how fast a run finishes.</p></div>
+          <div class="providers" id="transcribers"></div>
+          <div class="field-row">
+            <label class="field">
+              <span>Model</span>
+              <select id="transModel"></select>
+            </label>
+            <label class="field" id="groqKeyField">
+              <span>Groq API key</span>
+              <input type="password" id="groqKey" placeholder="gsk_..." autocomplete="off">
+              <small id="groqKeyState">Not set</small>
+            </label>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h3>Output</h3><p>Where finished clips get written.</p></div>
+          <label class="field">
+            <span>Folder</span>
+            <input type="text" id="outdir" spellcheck="false">
+          </label>
+          <label class="toggle">
+            <input type="checkbox" id="vertical">
+            <i></i>
+            <div><strong>Vertical 1080x1920</strong><span>Sized for Shorts, Reels and TikTok</span></div>
+          </label>
+          <label class="toggle">
+            <input type="checkbox" id="blurPad">
+            <i></i>
+            <div><strong>Blurred background fill</strong><span>Fills the empty space instead of black bars</span></div>
+          </label>
+        </div>
+
+        <div class="settings-foot">
+          <button class="btn btn-accent" type="submit">Save settings</button>
+          <span class="saved" id="savedNote" hidden>Saved</span>
+        </div>
+      </form>
+    </section>
+
+  </main>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

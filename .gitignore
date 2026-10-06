@@ -1,0 +1,30 @@
+# Settings file holds API keys. It lives in the home folder, never here,
+# but block it anyway in case anyone copies one in.
+.viral_clipper.json
+*.env
+.env*
+
+# Exported clips and anything downloaded
+viral_clips/
+clips/
+*.mp4
+*.mkv
+*.webm
+*.mp3
+*.wav
+cookies.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
