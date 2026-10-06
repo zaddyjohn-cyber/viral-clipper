@@ -6,8 +6,10 @@ Pure functions, no UI. Used by server.py.
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -127,6 +129,47 @@ def probe_duration(path):
         return 0.0
 
 
+CACHE_DIR = Path.home() / ".viral_clipper_cache"
+
+
+def cached_media(url, audio_only):
+    """Downloads are expensive on a weak line, so keep them between runs."""
+    import hashlib
+    key = hashlib.sha1(f"{url}|{'a' if audio_only else 'v'}".encode()).hexdigest()[:16]
+    CACHE_DIR.mkdir(exist_ok=True)
+    hits = sorted(CACHE_DIR.glob(f"{key}.*"))
+    return key, (hits[0] if hits else None)
+
+
+def _key(*parts):
+    import hashlib
+    return hashlib.sha1("|".join(str(x) for x in parts).encode()).hexdigest()[:16]
+
+
+def checkpoint_dir(url):
+    d = CACHE_DIR / f"run_{_key(url)}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def load_checkpoint(url, name):
+    f = checkpoint_dir(url) / f"{name}.json"
+    if not f.exists():
+        return None
+    try:
+        return json.loads(f.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def save_checkpoint(url, name, data):
+    try:
+        (checkpoint_dir(url) / f"{name}.json").write_text(
+            json.dumps(data), encoding="utf-8")
+    except OSError:
+        pass            # a lost checkpoint only costs time, never correctness
+
+
 def cookie_args(cookies_browser, cookies_file):
     """A cookies.txt file wins. It is the only option that works headless."""
     if cookies_file and Path(cookies_file).is_file():
@@ -136,8 +179,14 @@ def cookie_args(cookies_browser, cookies_file):
     return []
 
 
-def download(url, out_dir, cookies_browser, progress, control=NOOP, cookies_file=""):
-    """Download to out_dir/source.*, return (path, meta dict)."""
+def download(url, out_dir, cookies_browser, progress, control=NOOP, cookies_file="",
+             audio_only=False):
+    """Download to out_dir/source.*, return (path, meta dict).
+
+    audio_only pulls roughly 1% of the bytes. Transcription never needs the
+    picture, so analysis uses it and the video is fetched later, only if the
+    user actually exports something.
+    """
     progress("Fetching video details", 0)
     ck = cookie_args(cookies_browser, cookies_file)
 
@@ -164,16 +213,28 @@ def download(url, out_dir, cookies_browser, progress, control=NOOP, cookies_file
             "Keep it under 3 hours so transcription finishes in reasonable time."
         )
 
+    key, hit = cached_media(url, audio_only)
+    if hit:
+        progress(f"Reusing the {'audio' if audio_only else 'video'} "
+                 "from an earlier run", 100)
+        if not meta.get("duration"):
+            meta["duration"] = probe_duration(hit)
+        meta.setdefault("title", "Untitled")
+        return hit, meta
+
     progress("Starting download", 0)
+    stem = "audio" if audio_only else "source"
+    fmt = ("bestaudio[abr<=70]/bestaudio/best" if audio_only else
+           # YouTube serves video-only and audio-only streams for most videos,
+           # so the merge selector has to come before any combined selector.
+           "bestvideo[height<=720]+bestaudio/best[height<=720]"
+           "/bestvideo+bestaudio/best")
     dl_cmd = [
         "yt-dlp", "--no-playlist", "--no-warnings", "--newline",
-        # YouTube now serves video-only and audio-only streams for most videos,
-        # so the merge selector has to come before any combined-stream selector.
-        "-f", ("bestvideo[height<=720]+bestaudio/best[height<=720]"
-               "/bestvideo+bestaudio/best"),
+        "-f", fmt,
         "--merge-output-format", "mp4",
         "--progress-template", "PCT %(progress._percent_str)s %(progress._speed_str)s",
-        "-o", str(out_dir / "source.%(ext)s"),
+        "-o", str(out_dir / (stem + ".%(ext)s")),
     ] + ck
 
     # Video and audio arrive as separate streams, so map each one onto half the bar.
@@ -192,12 +253,14 @@ def download(url, out_dir, cookies_browser, progress, control=NOOP, cookies_file
         if pct + 1 < seen["last"]:
             seen["n"] += 1
         seen["last"] = pct
-        half = 50 if seen["n"] == 0 else 50
-        base = 0 if seen["n"] == 0 else 50
         speed = parts[2] if len(parts) > 2 and parts[2] != "Unknown" else ""
-        progress(f"Downloading {'video' if seen['n'] == 0 else 'audio'}"
-                 + (f" at {speed}" if speed else ""),
-                 min(99, base + pct * half / 100))
+        if audio_only:
+            label, base, span = "audio", 0, 100
+        else:
+            label = "video" if seen["n"] == 0 else "audio"
+            base, span = (0, 50) if seen["n"] == 0 else (50, 50)
+        progress(f"Downloading {label}" + (f" at {speed}" if speed else ""),
+                 min(99, base + pct * span / 100))
 
     code, stderr = _stream(dl_cmd + [url], control, on_line)
     progress("Merging streams", 99)
@@ -219,11 +282,18 @@ def download(url, out_dir, cookies_browser, progress, control=NOOP, cookies_file
             raise RuntimeError("That link is not a video page this tool can read.")
         raise RuntimeError(f"Download failed. {err[-300:]}")
 
-    files = [f for f in out_dir.iterdir() if f.stem == "source"]
+    files = [f for f in out_dir.iterdir() if f.stem == stem]
     if not files:
         raise RuntimeError("Download finished but produced no file.")
 
     path = files[0]
+    try:
+        keep = CACHE_DIR / f"{key}{path.suffix}"
+        shutil.move(str(path), keep)
+        path = keep
+    except OSError:
+        pass            # cache is a convenience, carry on with the temp copy
+
     if not meta.get("duration"):
         meta["duration"] = probe_duration(path)
     meta.setdefault("title", "Untitled")
@@ -231,7 +301,12 @@ def download(url, out_dir, cookies_browser, progress, control=NOOP, cookies_file
 
 
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
-GROQ_CHUNK_SECONDS = 600          # keeps each upload well under the size cap
+# Whisper only listens at 16kHz mono, so a low bitrate loses nothing that
+# matters and keeps whole hours inside one upload.
+GROQ_BITRATE_K = 24
+GROQ_TARGET_MB = 5        # small enough to survive an unstable upload
+GROQ_CHUNK_SECONDS = int(GROQ_TARGET_MB * 1024 * 8 / GROQ_BITRATE_K)
+GROQ_ATTEMPTS = 4
 GROQ_MAX_BYTES = 24 * 1024 * 1024
 
 TRANSCRIBERS = {
@@ -314,7 +389,7 @@ def _transcribe_local(video_path, model_name, progress, control=NOOP):
     return out
 
 
-def _transcribe_groq(video_path, model_name, api_key, progress, control=NOOP):
+def _transcribe_groq(video_path, model_name, api_key, progress, control=NOOP, url=""):
     """Chunked upload. Long videos exceed Groq's per-file cap in one piece."""
     import httpx
     if not api_key:
@@ -324,8 +399,32 @@ def _transcribe_groq(video_path, model_name, api_key, progress, control=NOOP):
     work = Path(video_path).parent / "audio"
     work.mkdir(exist_ok=True)
 
+    # One decode pass for the whole file. Slicing the original per chunk meant
+    # re-decoding the source dozens of times, which was the real bottleneck.
+    compact = work / "speech.mp3"
+    if not compact.exists():
+        progress("Compressing audio for upload", 0)
+        partial = work / "speech.part.mp3"
+        proc = _run(["ffmpeg", "-y", "-i", str(video_path), "-vn",
+                     "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame",
+                     "-b:a", f"{GROQ_BITRATE_K}k", str(partial)], control)
+        if proc.returncode != 0 or not partial.exists():
+            partial.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"Could not prepare the audio. {(proc.stderr or '')[-200:]}")
+        partial.replace(compact)        # only named speech.mp3 once complete
+    source = compact
+
     starts = [s for s in range(0, max(1, int(total)), GROQ_CHUNK_SECONDS)]
     out = []
+
+    # Each chunk is saved the moment it lands, so a dropped connection costs
+    # one chunk rather than the whole transcript.
+    done = {}
+    if url:
+        done = (load_checkpoint(url, f"chunks_{model_name}") or {})
+        if done:
+            progress(f"Picking up {len(done)} chunks from the last run", 0)
 
     for i, start in enumerate(starts):
         control.check()
@@ -333,37 +432,67 @@ def _transcribe_groq(video_path, model_name, api_key, progress, control=NOOP):
         if span <= 0.5:
             break
 
+        if str(i) in done:
+            out += done[str(i)]
+            progress(f"Already had {fmt_time(start)} to {fmt_time(start + span)}",
+                     min(99, (i + 1) / len(starts) * 100))
+            continue
+
         base = i / len(starts) * 100
         step = 100 / len(starts)
         progress(f"Preparing audio {i + 1} of {len(starts)}", base)
-        piece = extract_audio(video_path, work / f"part{i}.mp3", control, start, span)
+        piece = work / f"part{i}.mp3"
+        proc = _run(["ffmpeg", "-y", "-ss", str(start), "-i", str(source),
+                     "-t", str(span), "-c", "copy", str(piece)], control)
+        if proc.returncode != 0 or not piece.exists():
+            piece = extract_audio(source, piece, control, start, span)
 
         if piece.stat().st_size > GROQ_MAX_BYTES:
             raise RuntimeError(
                 "An audio chunk came out too large to upload. "
                 "Switch to faster-whisper in Settings for this one.")
 
-        progress(f"Transcribing {fmt_time(start)} to {fmt_time(start + span)}",
-                 base + step * 0.35)
-        control.check()
-        try:
-            with open(piece, "rb") as fh:
-                res = httpx.post(
-                    GROQ_URL,
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    files={"file": (piece.name, fh, "audio/mpeg")},
-                    data={"model": model_name, "response_format": "verbose_json",
-                          "temperature": "0"},
-                    timeout=600.0)
-        except httpx.HTTPError as e:
-            raise RuntimeError(f"Could not reach Groq. {e}")
-        finally:
-            piece.unlink(missing_ok=True)
+        label = f"{fmt_time(start)} to {fmt_time(start + span)}"
+        res = None
+        for attempt in range(1, GROQ_ATTEMPTS + 1):
+            control.check()
+            note = "" if attempt == 1 else f", retry {attempt - 1}"
+            progress(f"Transcribing {label}{note}", base + step * 0.35)
+            try:
+                with open(piece, "rb") as fh:
+                    res = httpx.post(
+                        GROQ_URL,
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        files={"file": (piece.name, fh, "audio/mpeg")},
+                        data={"model": model_name, "response_format": "verbose_json",
+                              "temperature": "0"},
+                        timeout=600.0)
+            except httpx.HTTPError as e:
+                # A dropped upload is normal on a weak line, so keep trying.
+                if attempt == GROQ_ATTEMPTS:
+                    piece.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f"Lost the connection to Groq {GROQ_ATTEMPTS} times while "
+                        f"sending {label}. Last error: {e}")
+                time.sleep(2 ** attempt)
+                continue
+
+            # A dropped upload reaches Groq as a truncated, unreadable file,
+            # so treat that 400 as transient too.
+            truncated = (res.status_code == 400
+                         and "valid media file" in res.text.lower())
+            if ((res.status_code in (429, 500, 502, 503, 504) or truncated)
+                    and attempt < GROQ_ATTEMPTS):
+                time.sleep(2 ** attempt)
+                continue
+            break
+
+        piece.unlink(missing_ok=True)
 
         if res.status_code == 401:
             raise RuntimeError("Your Groq API key was rejected. Check it in Settings.")
         if res.status_code == 429:
-            raise RuntimeError("Groq rate limit hit. Wait a moment and retry.")
+            raise RuntimeError("Groq rate limit hit. Wait a few minutes and retry.")
         if res.status_code == 413:
             raise RuntimeError("Groq rejected the audio as too large.")
         if res.status_code >= 400:
@@ -374,11 +503,17 @@ def _transcribe_groq(video_path, model_name, api_key, progress, control=NOOP):
         except json.JSONDecodeError:
             raise RuntimeError("Groq sent back a response that could not be read.")
 
+        got = []
         for seg in segments:
             text = (seg.get("text") or "").strip()
             if text:
-                out.append({"start": seg["start"] + start,
+                got.append({"start": seg["start"] + start,
                             "end": seg["end"] + start, "text": text})
+        out += got
+
+        if url:
+            done[str(i)] = got
+            save_checkpoint(url, f"chunks_{model_name}", done)
 
         progress(f"Transcribed {fmt_time(min(start + span, total))} of {fmt_time(total)}",
                  min(99, (i + 1) / len(starts) * 100))
@@ -387,10 +522,25 @@ def _transcribe_groq(video_path, model_name, api_key, progress, control=NOOP):
     return out
 
 
-def transcribe(video_path, transcriber, model_name, api_key, progress, control=NOOP):
+def transcribe(video_path, transcriber, model_name, api_key, progress,
+               control=NOOP, url=""):
+    """Returns timestamped segments, resuming from checkpoints where possible."""
+    if url:
+        cached = load_checkpoint(url, f"transcript_{transcriber}_{model_name}")
+        if cached:
+            progress(f"Reusing the transcript from an earlier run "
+                     f"({len(cached)} lines)", 100)
+            return cached
+
     if transcriber == "groq":
-        return _transcribe_groq(video_path, model_name, api_key, progress, control)
-    return _transcribe_local(video_path, model_name, progress, control)
+        out = _transcribe_groq(video_path, model_name, api_key, progress,
+                               control, url)
+    else:
+        out = _transcribe_local(video_path, model_name, progress, control)
+
+    if url and out:
+        save_checkpoint(url, f"transcript_{transcriber}_{model_name}", out)
+    return out
 
 
 def _api_error(e):
@@ -453,41 +603,55 @@ def _call_openai_compatible(prompt, api_key, model, base_url):
         raise RuntimeError("The scoring API sent back an unexpected response.")
 
 
-def score_moments(segments, provider, api_key, clip_len, max_clips, progress):
+def score_moments(segments, provider, api_key, clip_len, max_clips, progress, url=""):
+    """Scores moments by line number.
+
+    Asking a model for raw timestamps invites it to invent them, and on a long
+    transcript it will. Citing line numbers forces every clip to point at real
+    speech, and the times and quotes are then read back from the transcript
+    rather than taken on trust.
+    """
+    stamp = f"clips_{provider}_{clip_len}_{max_clips}"
+    if url:
+        cached = load_checkpoint(url, stamp)
+        if cached:
+            progress(f"Reusing {len(cached)} moments scored earlier", 100)
+            return cached
+
     spec = PROVIDERS.get(provider)
     if not spec:
         raise RuntimeError(f"Unknown scoring provider '{provider}'.")
-    progress(f"Scoring moments with {spec['label']}")
+    progress(f"Scoring moments with {spec['label']}", 20)
 
-    transcript = "\n".join(f"[{fmt_time(s['start'])}] {s['text']}" for s in segments)
+    numbered = "\n".join(
+        f"{i}\t{fmt_time(sg['start'])}\t{sg['text']}"
+        for i, sg in enumerate(segments))
     total = segments[-1]["end"]
     lo, hi = max(15, clip_len - 25), clip_len + 20
 
     prompt = f"""You are a short-form video editor who has shipped thousands of viral clips.
 
-Below is a timestamped transcript of a {fmt_time(total)} video. Find the strongest standalone moments to cut into vertical shorts of roughly {clip_len} seconds.
+Below is a transcript of a {fmt_time(total)} video. Every line is numbered. Find the strongest standalone moments to cut into vertical shorts of roughly {clip_len} seconds.
 
 What makes a clip work:
 - Lands a hook in the first 2 seconds, no slow build
-- Contains one complete thought, story, or payoff that stands alone without the rest of the video
+- One complete thought, story or payoff that stands alone without the rest of the video
 - Carries tension, a surprising claim, a reveal, strong emotion, a specific number, or a contrarian take
 - Starts and ends on clean sentence boundaries
 
-TRANSCRIPT (timestamps are MM:SS or H:MM:SS from the start):
-{transcript}
+TRANSCRIPT, as "line<TAB>time<TAB>text":
+{numbered}
 
-Return up to {max_clips} windows, best first. Each window must be {lo} to {hi} seconds long and must not overlap another window.
+Return up to {max_clips} clips, best first, as line ranges. start_line and end_line must be real line numbers from above, between 0 and {len(segments) - 1}. Each clip must run {lo} to {hi} seconds and must not overlap another clip.
 
-Score viral potential from 0 to 100 and be honest. Reserve 85 and above for clips you would personally bet money on. Most clips in an average video score between 40 and 70. Do not inflate.
+Do not invent or paraphrase. The hook you report must be copied exactly from the text of start_line.
 
-For each clip also give:
-- title: a 3 to 6 word label for the moment
-- hook: the actual opening words of the clip, quoted from the transcript
-- reason: at most 16 words on why it performs
-- tags: 1 to 3 single words from this set only: hook, story, emotion, insight, conflict, humor, data, howto, reveal
+Score viral potential 0 to 100 and be honest. Reserve 85 and above for clips you would personally bet money on. Most clips in an average video land between 40 and 70.
 
-Respond with raw JSON only. No markdown fence, no commentary.
-{{"clips":[{{"start_seconds":42.0,"end_seconds":102.0,"viral_score":87,"title":"The hiring mistake","hook":"Everybody told me to hire slow","reason":"Contrarian claim up front, concrete story, clean payoff","tags":["insight","story"]}}]}}"""
+Also give a title of 3 to 6 words, a reason of at most 16 words, and 1 to 3 tags from: hook, story, emotion, insight, conflict, humor, data, howto, reveal.
+
+Respond with raw JSON only, no markdown fence:
+{{"clips":[{{"start_line":412,"end_line":436,"viral_score":87,"title":"The hiring mistake","hook":"exact text of line 412","reason":"why it performs","tags":["insight","story"]}}]}}"""
 
     if provider == "anthropic":
         text = _call_anthropic(prompt, api_key, spec["model"])
@@ -497,29 +661,61 @@ Respond with raw JSON only. No markdown fence, no commentary.
 
     raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
     try:
-        clips = json.loads(raw)["clips"]
+        proposed = json.loads(raw)["clips"]
     except (json.JSONDecodeError, KeyError):
         raise RuntimeError("The AI response could not be read. Try running it again.")
 
-    clips.sort(key=lambda c: -c.get("viral_score", 0))
-    clean = []
-    for i, c in enumerate(clips[:max_clips], 1):
-        start = max(0.0, float(c["start_seconds"]))
-        end = min(float(c["end_seconds"]), total)
-        if end - start < 8:
+    proposed.sort(key=lambda c: -c.get("viral_score", 0))
+    clean, used = [], []
+
+    for c in proposed:
+        try:
+            a = int(c["start_line"])
+            b = int(c["end_line"])
+        except (KeyError, TypeError, ValueError):
             continue
+        if not (0 <= a < len(segments)) or not (0 <= b < len(segments)) or b <= a:
+            continue
+
+        start = segments[a]["start"]
+        end = min(segments[b]["end"], total)
+
+        # Grow or trim to the requested length, always landing on a real line.
+        while end - start < lo and b + 1 < len(segments):
+            b += 1
+            end = min(segments[b]["end"], total)
+        while end - start > hi and b - 1 > a:
+            b -= 1
+            end = segments[b]["end"]
+        if end - start < 10:
+            continue
+        if any(start < u_end and end > u_start for u_start, u_end in used):
+            continue
+
+        used.append((start, end))
         clean.append({
-            "n": i,
+            "n": len(clean) + 1,
             "start": round(start, 2),
             "end": round(end, 2),
             "duration": round(end - start, 1),
-            "score": int(c.get("viral_score", 0)),
-            "title": c.get("title") or f"Moment {i}",
-            "hook": c.get("hook") or "",
-            "reason": c.get("reason") or "",
+            "score": max(0, min(100, int(c.get("viral_score", 0)))),
+            "title": (c.get("title") or f"Moment {len(clean) + 1}")[:70],
+            "hook": segments[a]["text"][:160],
+            "reason": (c.get("reason") or "")[:140],
             "tags": [t for t in (c.get("tags") or [])[:3] if isinstance(t, str)],
+            "lines": [a, b],
             "exported": False,
         })
+        if len(clean) >= max_clips:
+            break
+
+    if not clean:
+        raise RuntimeError(
+            "The scoring model did not point at any usable part of the "
+            "transcript. Try running it again, or switch provider in Settings.")
+
+    if url:
+        save_checkpoint(url, stamp, clean)
     return clean
 
 

@@ -246,6 +246,12 @@ async function refreshExports() {
     state.exporting = busy;
     paintGrid(job.clips);
     paintRunPill(job);
+    if (job.export_error) {
+      state.exporting = false;
+      clearInterval(state.poll);
+      toast('Could not fetch the video', job.export_error, 'err');
+      return;
+    }
     if (wasExporting && !busy) {
       const n = job.clips.filter(c => c.exported).length;
       toast('Clips exported', `${n} file${n === 1 ? '' : 's'} written to your output folder.`, 'ok');
@@ -284,11 +290,12 @@ function paintRunPill(job) {
   const live = job && (job.status === 'running' || job.exporting);
   pill.hidden = !live;
   if (!live) return;
-  const pct = Math.round(job.exporting ? 100 : job.percent || 0);
-  $('#runPillStage').textContent = job.exporting
-    ? 'Exporting' : STAGE_WORD[job.stage] || 'Working';
-  $('#runPillPct').textContent = job.exporting ? '' : pct + '%';
-  $('#runPillBar').style.width = (job.exporting ? 100 : pct) + '%';
+  const indet = job.exporting && !job.fetching_video;
+  const pct = Math.round(indet ? 100 : job.percent || 0);
+  $('#runPillStage').textContent = job.fetching_video ? 'Fetching video'
+    : job.exporting ? 'Exporting' : STAGE_WORD[job.stage] || 'Working';
+  $('#runPillPct').textContent = indet ? '' : pct + '%';
+  $('#runPillBar').style.width = pct + '%';
   $('#runPillMsg').textContent = job.message || '';
 }
 
@@ -418,6 +425,18 @@ $('#exportBtn').addEventListener('click', () => exportClips([...state.picked]));
 
 async function exportClips(nums) {
   if (!state.job || !nums.length) return;
+
+  if (!state.job.has_video) {
+    const mins = Math.round((state.job.meta?.duration || 0) / 60);
+    const ok = confirm(
+      `Analysis only downloaded the audio. Exporting needs the video, which is ` +
+      `a one-time download of the full ${mins} minute source.
+
+` +
+      `It happens once, then every clip you export is instant. Continue?`);
+    if (!ok) return;
+  }
+
   try {
     await api(`/api/job/${state.job.id}/export`, {
       method: 'POST', body: JSON.stringify({ clips: nums }),

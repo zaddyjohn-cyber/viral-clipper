@@ -121,7 +121,8 @@ def new_job(url):
             "clips": [], "meta": {}, "exporting": False,
             "platform": engine.platform_of(url),
             "temp": tempfile.mkdtemp(prefix="viralclip_"),
-            "video": None, "control": engine.Control(),
+            "video": None, "audio": None, "fetching_video": False,
+            "export_error": None, "control": engine.Control(),
             "started": time.time(),
         }
     return jobs[jid]
@@ -142,6 +143,9 @@ def public_job(job):
         "message": job["message"], "percent": round(job["percent"], 1),
         "error": job["error"], "clips": job["clips"], "meta": job["meta"],
         "exporting": job["exporting"], "stages": STAGES,
+        "fetching_video": job.get("fetching_video", False),
+        "export_error": job.get("export_error"),
+        "has_video": bool(job.get("video")),
         "elapsed": round(time.time() - job["started"]),
     }
 
@@ -156,7 +160,36 @@ def latest_job():
 
 # ---------- analysis pipeline ----------
 
+PIPELINE_ATTEMPTS = 3
+PERMANENT = ("api key was rejected", "needs a login", "signed-in session",
+             "no speech was found", "not a video page", "too large",
+             "is not installed")
+
+
 def run_pipeline(job, cfg):
+    """Retries itself on transient failures. Checkpoints make each retry cheap."""
+    for attempt in range(1, PIPELINE_ATTEMPTS + 1):
+        _run_pipeline_once(job, cfg)
+
+        if job["status"] != "error":
+            return
+        if job["control"].cancelled:
+            return
+
+        err = (job["error"] or "").lower()
+        if any(k in err for k in PERMANENT):
+            return                      # retrying will not change the answer
+        if attempt == PIPELINE_ATTEMPTS:
+            job["message"] = "Stopped after several tries"
+            return
+
+        job["status"] = "running"
+        job["message"] = f"Hit a snag, picking up where it left off ({attempt})"
+        job["error"] = None
+        time.sleep(3 * attempt)
+
+
+def _run_pipeline_once(job, cfg):
     jid = job["id"]
     temp = Path(job["temp"])
     ctl = job["control"]
@@ -178,16 +211,16 @@ def run_pipeline(job, cfg):
 
     try:
         stage("download")
-        video, meta = engine.download(
+        audio, meta = engine.download(
             job["url"], temp, cfg["cookies"], progress, ctl,
-            cfg.get("cookies_file", ""))
-        job["video"] = str(video)
+            cfg.get("cookies_file", ""), audio_only=True)
+        job["audio"] = str(audio)
         job["meta"] = meta
 
         stage("transcribe")
         segments = engine.transcribe(
-            video, cfg["transcriber"], transcribe_model(cfg),
-            transcribe_key(cfg), progress, ctl)
+            audio, cfg["transcriber"], transcribe_model(cfg),
+            transcribe_key(cfg), progress, ctl, job["url"])
         if not segments:
             raise RuntimeError(
                 "No speech was found in this video. This tool needs talking to work with.")
@@ -196,18 +229,13 @@ def run_pipeline(job, cfg):
         progress("Sending the transcript for scoring", 20)
         clips = engine.score_moments(
             segments, cfg["provider"], active_key(cfg), int(cfg["clip_len"]),
-            int(cfg["max_clips"]), progress)
+            int(cfg["max_clips"]), progress, job["url"])
         if not clips:
             raise RuntimeError("No moments in this video were strong enough to clip.")
 
-        thumbs = temp / "thumbs"
-        thumbs.mkdir(exist_ok=True)
-        for i, c in enumerate(clips, 1):
-            ctl.check()
-            progress(f"Building preview {i} of {len(clips)}",
-                     60 + i / len(clips) * 40)
-            if engine.make_thumb(video, c["start"], thumbs / f"{c['n']}.jpg"):
-                c["thumb"] = f"/api/thumb/{jid}/{c['n']}"
+        poster = meta.get("thumbnail") or ""
+        for c in clips:
+            c["thumb"] = poster
 
         job["clips"] = clips
         stage("ready")
@@ -225,14 +253,48 @@ def run_pipeline(job, cfg):
         job["message"] = "Stopped"
 
 
+def ensure_video(job, cfg):
+    """Pull the picture only now that the user wants actual clips."""
+    if job.get("video") and Path(job["video"]).exists():
+        return job["video"]
+
+    ctl = job["control"]
+    job["fetching_video"] = True
+
+    def progress(msg, percent=None):
+        job["message"] = msg
+        if percent is not None:
+            job["percent"] = percent
+
+    try:
+        video, _ = engine.download(
+            job["url"], Path(job["temp"]), cfg["cookies"], progress, ctl,
+            cfg.get("cookies_file", ""), audio_only=False)
+        job["video"] = str(video)
+        return job["video"]
+    finally:
+        job["fetching_video"] = False
+
+
 def run_export(job, clip_numbers, cfg):
     out = Path(cfg["outdir"])
     out.mkdir(parents=True, exist_ok=True)
-    video = job["video"]
     ctl = job["control"]
     title_slug = engine.slugify(job["meta"].get("title", ""), 28)
     picked = [c for c in job["clips"] if c["n"] in clip_numbers]
     job["exporting"] = True
+
+    try:
+        video = ensure_video(job, cfg)
+    except engine.Cancelled:
+        job["exporting"] = False
+        job["message"] = "Export stopped"
+        return
+    except Exception as e:
+        job["exporting"] = False
+        job["export_error"] = str(e)
+        job["message"] = "Could not fetch the video"
+        return
 
     for i, c in enumerate(picked, 1):
         c["exporting"] = True
