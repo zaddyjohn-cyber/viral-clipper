@@ -3,6 +3,7 @@ Clip engine: download, transcribe, score, cut.
 Pure functions, no UI. Used by server.py.
 """
 
+import collections
 import json
 import os
 import re
@@ -107,17 +108,27 @@ def _run(cmd, control=NOOP):
 
 
 def _stream(cmd, control, on_line):
-    """Run a command, feeding each stdout line to on_line. Returns (code, stderr)."""
+    """Run a command, feeding each output line to on_line. Returns (code, tail).
+
+    stderr is merged into stdout deliberately. Draining only stdout while
+    ffmpeg writes to a separate stderr pipe deadlocks as soon as that pipe
+    fills: ffmpeg blocks on stderr, stops emitting progress, and the reader
+    waits forever on stdout. Burning captions produces more than enough log
+    output to hit that.
+    """
     control.check()
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
                             text=True, bufsize=1, creationflags=NO_WINDOW)
     control.attach(proc)
+    tail = collections.deque(maxlen=40)
     for line in proc.stdout:
-        on_line(line.strip())
+        line = line.rstrip()
+        tail.append(line)
+        on_line(line)
     proc.wait()
-    err = proc.stderr.read()
     control.check()
-    return proc.returncode, err
+    return proc.returncode, chr(10).join(tail)
 
 
 def probe_duration(path):
@@ -840,9 +851,12 @@ def cut(video_path, start, end, out_path, vertical, blur_pad=True,
     caption = _ass_filter(subs) if subs else ""
     if vertical:
         if blur_pad:
+            # Blur a thumbnail and scale it up rather than blurring at full
+            # size. Same look, and it does not pin a weak CPU for minutes.
             vf = ("[0:v]split=2[bg][fg];"
-                  "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
-                  "crop=1080:1920,gblur=sigma=28[bgb];"
+                  "[bg]scale=135:240:force_original_aspect_ratio=increase,"
+                  "crop=135:240,gblur=sigma=4,"
+                  "scale=1080:1920:flags=bilinear[bgb];"
                   "[fg]scale=1080:1920:force_original_aspect_ratio=decrease[fgs];"
                   "[bgb][fgs]overlay=(W-w)/2:(H-h)/2")
             if caption:

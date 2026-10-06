@@ -383,6 +383,18 @@ def api_get_config():
 
 @app.post("/api/config")
 def api_set_config(body: dict):
+    # Pasting the cookie file's contents here would store live session
+    # credentials in plain text, so only accept something path-shaped.
+    cf = (body.get("cookies_file") or "").strip()
+    if cf:
+        if len(cf) > 400 or chr(10) in cf or chr(9) in cf or "# Netscape" in cf:
+            raise HTTPException(
+                400, "That looks like the contents of the cookie file. "
+                     "Paste the path to the file instead, for example "
+                     "C:\\Users\\you\\Downloads\\cookies.txt")
+        if not Path(cf).is_file():
+            raise HTTPException(400, f"No file found at {cf}")
+        body["cookies_file"] = cf
     if body.get("provider") and body["provider"] not in engine.PROVIDERS:
         raise HTTPException(400, "Unknown scoring provider.")
     if body.get("transcriber") and body["transcriber"] not in engine.TRANSCRIBERS:
