@@ -384,6 +384,14 @@ function paintGrid(clips) {
         <div class="clip-title">${esc(c.title)}</div>
         ${c.hook ? `<div class="clip-hook">${esc(c.hook)}</div>` : ''}
         ${c.reason ? `<div class="clip-reason">${esc(c.reason)}</div>` : ''}
+        <div class="clip-listen">
+          <button class="listen" data-listen="${c.n}" title="Hear this moment">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.5v13l11-6.5z"/></svg>
+            Listen
+          </button>
+          ${c.text ? `<button class="readmore" data-read="${c.n}">Read it</button>` : ''}
+        </div>
+        ${c.text ? `<div class="clip-text" id="txt-${c.n}" hidden>${esc(c.text)}</div>` : ''}
         ${c.tags?.length ? `<div class="clip-tags">${c.tags.map(t => `<span>${esc(t)}</span>`).join('')}</div>` : ''}
       </div>
       <div class="clip-foot">${foot}</div>
@@ -411,7 +419,41 @@ $('#clipGrid').addEventListener('click', async e => {
   }
   const one = e.target.closest('[data-export]');
   if (one) { exportClips([+one.dataset.export]); return; }
+
+  const read = e.target.closest('[data-read]');
+  if (read) {
+    const box = $('#txt-' + read.dataset.read);
+    box.hidden = !box.hidden;
+    read.textContent = box.hidden ? 'Read it' : 'Hide';
+    return;
+  }
+
+  const play = e.target.closest('[data-listen]');
+  if (play) { listen(+play.dataset.listen, play); return; }
 });
+
+let player = null;
+let playingN = null;
+
+function listen(n, btn) {
+  const stop = () => {
+    if (player) { player.pause(); player = null; }
+    $$('[data-listen]').forEach(b => b.classList.remove('is-playing'));
+    playingN = null;
+  };
+
+  if (playingN === n) { stop(); return; }
+  stop();
+
+  playingN = n;
+  btn.classList.add('is-playing');
+  player = new Audio(`/api/preview/${state.job.id}/${n}`);
+  player.play().catch(() => {
+    toast('Could not play that', 'The audio for this run may have been cleared.', 'err');
+    stop();
+  });
+  player.addEventListener('ended', stop);
+}
 
 $('#selectAllBtn').addEventListener('click', () => {
   state.job?.clips.forEach(c => state.picked.add(c.n));

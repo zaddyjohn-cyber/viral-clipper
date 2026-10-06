@@ -396,8 +396,10 @@ def _transcribe_groq(video_path, model_name, api_key, progress, control=NOOP, ur
         raise RuntimeError("Add your Groq API key in Settings first.")
 
     total = probe_duration(video_path) or 1
-    work = Path(video_path).parent / "audio"
-    work.mkdir(exist_ok=True)
+    # Scope the workspace to this exact source file. A shared folder let one
+    # video's compressed audio be picked up and transcribed for another.
+    work = Path(video_path).parent / f"work_{Path(video_path).stem}"
+    work.mkdir(parents=True, exist_ok=True)
 
     # One decode pass for the whole file. Slicing the original per chunk meant
     # re-decoding the source dozens of times, which was the real bottleneck.
@@ -701,6 +703,7 @@ Respond with raw JSON only, no markdown fence:
             "score": max(0, min(100, int(c.get("viral_score", 0)))),
             "title": (c.get("title") or f"Moment {len(clean) + 1}")[:70],
             "hook": segments[a]["text"][:160],
+            "text": " ".join(sg["text"] for sg in segments[a:b + 1])[:1400],
             "reason": (c.get("reason") or "")[:140],
             "tags": [t for t in (c.get("tags") or [])[:3] if isinstance(t, str)],
             "lines": [a, b],

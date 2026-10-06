@@ -457,6 +457,35 @@ def api_thumb(jid: str, n: int):
     return FileResponse(path, media_type="image/jpeg")
 
 
+@app.get("/api/preview/{jid}/{n}")
+def api_preview(jid: str, n: int):
+    """Audio of a clip, cut from the file analysis already downloaded.
+
+    Lets you hear a moment before committing to the full video download.
+    """
+    job = get_job(jid)
+    clip = next((c for c in job["clips"] if c["n"] == n), None)
+    if not clip:
+        raise HTTPException(404, "No such clip.")
+    if not job.get("audio") or not Path(job["audio"]).exists():
+        raise HTTPException(404, "The audio for this run is no longer around.")
+
+    out = Path(job["temp"]) / "previews"
+    out.mkdir(parents=True, exist_ok=True)
+    piece = out / f"{n}.mp3"
+
+    if not piece.exists():
+        proc = engine._run([
+            "ffmpeg", "-y", "-ss", str(clip["start"]), "-i", job["audio"],
+            "-t", str(clip["end"] - clip["start"]),
+            "-ac", "1", "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "96k",
+            str(piece)])
+        if proc.returncode != 0 or not piece.exists():
+            raise HTTPException(500, "Could not build the preview.")
+
+    return FileResponse(piece, media_type="audio/mpeg")
+
+
 @app.get("/api/clip/{jid}/{n}")
 def api_clip(jid: str, n: int):
     job = get_job(jid)
