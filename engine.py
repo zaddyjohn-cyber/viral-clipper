@@ -722,17 +722,122 @@ Respond with raw JSON only, no markdown fence:
     return clean
 
 
+# Caption looks. ASS colours are &HAABBGGRR, so the byte order is reversed.
+CAPTION_STYLES = {
+    "none": {"label": "No captions", "blurb": "Clean video, nothing burned in."},
+    "punch": {
+        "label": "Punch",
+        "blurb": "Big white caps with a heavy black stroke. The default look on Shorts.",
+        "font": "Arial Black", "size": 92, "primary": "&H00FFFFFF",
+        "outline": "&H00000000", "back": "&H00000000", "border": 1,
+        "outline_w": 7, "shadow": 3, "upper": True, "margin_v": 300,
+    },
+    "pop": {
+        "label": "Pop",
+        "blurb": "Yellow on black outline. Reads well over busy footage.",
+        "font": "Arial Black", "size": 88, "primary": "&H0000F0FF",
+        "outline": "&H00000000", "back": "&H00000000", "border": 1,
+        "outline_w": 6, "shadow": 2, "upper": True, "margin_v": 300,
+    },
+    "clean": {
+        "label": "Clean",
+        "blurb": "White on a soft dark band. Calmer, good for talking heads.",
+        "font": "Arial", "size": 74, "primary": "&H00FFFFFF",
+        # BorderStyle 3 draws the box, and its padding comes from Outline,
+        # so that has to be non-zero or the band never appears.
+        "outline": "&H00000000", "back": "&HB0000000", "border": 3,
+        "outline_w": 14, "shadow": 0, "upper": False, "margin_v": 280,
+    },
+}
+
+CAPTION_WORDS = 4          # short lines read faster on a phone
+
+
+def _ass_time(t):
+    t = max(0.0, t)
+    h, rem = divmod(t, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{int(h)}:{int(m):02d}:{sec:05.2f}"
+
+
+def _caption_lines(segments, start, end):
+    """Transcript lines inside the clip, split short and timed clip-relative."""
+    out = []
+    for sg in segments:
+        if sg["end"] <= start or sg["start"] >= end:
+            continue
+        words = sg["text"].split()
+        if not words:
+            continue
+
+        a = max(sg["start"], start) - start
+        b = min(sg["end"], end) - start
+        if b - a < 0.08:
+            continue
+
+        groups = [words[i:i + CAPTION_WORDS]
+                  for i in range(0, len(words), CAPTION_WORDS)]
+        step = (b - a) / len(groups)
+        for i, g in enumerate(groups):
+            out.append((a + i * step, a + (i + 1) * step, " ".join(g)))
+    return out
+
+
+def build_ass(segments, start, end, style_name, out_path, width=1080, height=1920):
+    st = CAPTION_STYLES.get(style_name)
+    if not st or style_name == "none":
+        return None
+    lines = _caption_lines(segments, start, end)
+    if not lines:
+        return None
+
+    head = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {width}
+PlayResY: {height}
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: Cap,{st['font']},{st['size']},{st['primary']},&H000000FF,{st['outline']},{st['back']},-1,0,0,0,100,100,0,0,{st['border']},{st['outline_w']},{st['shadow']},2,90,90,{st['margin_v']},1
+
+[Events]
+Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+"""
+
+    body = []
+    for a, b, text in lines:
+        if st["upper"]:
+            text = text.upper()
+        text = (text.replace("\\", "").replace("{", "(").replace("}", ")")
+                    .replace("\n", " "))
+        body.append(f"Dialogue: 0,{_ass_time(a)},{_ass_time(b)},Cap,,0,0,0,,{text}")
+
+    out_path.write_text(head + "\n".join(body) + "\n", encoding="utf-8")
+    return out_path
+
+
 def make_thumb(video_path, at_seconds, out_path):
     _run(["ffmpeg", "-y", "-ss", str(at_seconds + 1), "-i", str(video_path),
           "-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "4", str(out_path)])
     return out_path.exists()
 
 
+def _ass_filter(path):
+    """ffmpeg reads the drive-letter colon as an option separator, so escape it."""
+    p = str(path).replace("\\", "/")
+    p = p.replace(":", chr(92) + ":").replace("'", chr(92) + "'")
+    return "ass='" + p + "'"
+
+
 def cut(video_path, start, end, out_path, vertical, blur_pad=True,
-        progress=None, control=NOOP):
+        progress=None, control=NOOP, subs=None):
     duration = end - start
     cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
            "-ss", str(start), "-i", str(video_path), "-t", str(duration)]
+
+    caption = _ass_filter(subs) if subs else ""
     if vertical:
         if blur_pad:
             vf = ("[0:v]split=2[bg][fg];"
@@ -740,10 +845,17 @@ def cut(video_path, start, end, out_path, vertical, blur_pad=True,
                   "crop=1080:1920,gblur=sigma=28[bgb];"
                   "[fg]scale=1080:1920:force_original_aspect_ratio=decrease[fgs];"
                   "[bgb][fgs]overlay=(W-w)/2:(H-h)/2")
+            if caption:
+                vf += f"[v];[v]{caption}"
             cmd += ["-filter_complex", vf]
         else:
-            cmd += ["-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,"
-                           "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"]
+            vf = ("scale=1080:1920:force_original_aspect_ratio=decrease,"
+                  "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black")
+            if caption:
+                vf += "," + caption
+            cmd += ["-vf", vf]
+    elif caption:
+        cmd += ["-vf", caption]
     cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart", str(out_path)]

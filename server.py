@@ -44,7 +44,8 @@ def load_config():
         "provider": "anthropic", "keys": {},
         "transcriber": "groq", "whisper_model": "base",
         "groq_model": "whisper-large-v3-turbo", "clip_len": 60,
-        "max_clips": 6, "cookies": "none", "cookies_file": "", "vertical": True,
+        "max_clips": 6, "cookies": "none", "cookies_file": "",
+        "captions": "punch", "vertical": True,
         "blur_pad": True, "outdir": str(DEFAULT_OUTPUT),
     }
     if CONFIG_FILE.exists():
@@ -61,6 +62,8 @@ def load_config():
         base["provider"] = "anthropic"
     if base["transcriber"] not in engine.TRANSCRIBERS:
         base["transcriber"] = "groq"
+    if base["captions"] not in engine.CAPTION_STYLES:
+        base["captions"] = "punch"
     return base
 
 
@@ -102,6 +105,10 @@ def redacted(cfg):
             "keys_url": v["keys_url"], "key_prefix": v["key_prefix"]}
         for p, v in engine.PROVIDERS.items()
     }
+    out["caption_styles"] = {
+        k: {"label": v["label"], "blurb": v["blurb"]}
+        for k, v in engine.CAPTION_STYLES.items()
+    }
     out["transcribers"] = {
         t: {"label": v["label"], "blurb": v["blurb"], "models": v["models"],
             "needs_key": v["needs_key"], "keys_url": v["keys_url"]}
@@ -121,7 +128,8 @@ def new_job(url):
             "clips": [], "meta": {}, "exporting": False,
             "platform": engine.platform_of(url),
             "temp": tempfile.mkdtemp(prefix="viralclip_"),
-            "video": None, "audio": None, "fetching_video": False,
+            "video": None, "audio": None, "segments": [],
+            "fetching_video": False,
             "export_error": None, "control": engine.Control(),
             "started": time.time(),
         }
@@ -225,6 +233,8 @@ def _run_pipeline_once(job, cfg):
             raise RuntimeError(
                 "No speech was found in this video. This tool needs talking to work with.")
 
+        job["segments"] = segments
+
         stage("score")
         progress("Sending the transcript for scoring", 20)
         clips = engine.score_moments(
@@ -303,11 +313,20 @@ def run_export(job, clip_numbers, cfg):
         job["message"] = f"Exporting clip {i} of {len(picked)}"
         name = f"{c['score']:02d}pct-{title_slug}-{engine.slugify(c['title'], 24)}.mp4"
         dest = out / name
+        subs = None
+        if cfg["captions"] != "none" and job.get("segments"):
+            try:
+                subs = engine.build_ass(
+                    job["segments"], c["start"], c["end"], cfg["captions"],
+                    Path(job["temp"]) / f"caps{c['n']}.ass")
+            except OSError:
+                subs = None         # a clip without captions beats no clip
+
         try:
             engine.cut(video, c["start"], c["end"], dest,
                        cfg["vertical"], cfg["blur_pad"],
                        progress=lambda p, c=c: c.__setitem__("percent", round(p)),
-                       control=ctl)
+                       control=ctl, subs=subs)
             c["exported"] = True
             c["file"] = str(dest)
         except engine.Cancelled:

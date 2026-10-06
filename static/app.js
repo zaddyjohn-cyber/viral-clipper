@@ -71,7 +71,23 @@ async function loadSettings() {
   $('#blurPad').checked = !!cfg.blur_pad;
   paintProviders();
   paintTranscribers();
+  paintCaptions();
 }
+
+function paintCaptions() {
+  $('#captionStyles').innerHTML = Object.entries(cfg.caption_styles).map(([id, c]) => `
+    <button type="button" class="prov ${id === cfg.captions ? 'is-on' : ''}" data-cap="${id}">
+      <strong>${esc(c.label)}</strong>
+      <span>${esc(c.blurb)}</span>
+    </button>`).join('');
+}
+
+$('#captionStyles').addEventListener('click', e => {
+  const btn = e.target.closest('[data-cap]');
+  if (!btn) return;
+  cfg.captions = btn.dataset.cap;
+  paintCaptions();
+});
 
 function paintTranscribers() {
   $('#transcribers').innerHTML = Object.entries(cfg.transcribers).map(([id, t]) => `
@@ -135,6 +151,7 @@ $('#settingsForm').addEventListener('submit', async e => {
   const body = {
     provider: cfg.provider,
     transcriber: cfg.transcriber,
+    captions: cfg.captions,
     clip_len: +$('#clipLen').value,
     max_clips: +$('#maxClips').value,
     cookies: $('#cookies').value,
