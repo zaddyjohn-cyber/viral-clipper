@@ -1,384 +1,103 @@
 """
-Viral Clipper server.
+Viral Clipper API.
+
 Run:  python server.py
 Then open http://127.0.0.1:8420
+
+This process validates requests, writes job rows and reads them back. It never
+downloads, transcribes, scores or cuts: worker.py does that, and by default one
+runs in a thread here so a single command still gets you a working app. Set
+CLIPPER_INLINE_WORKER=0 and run worker.py separately to spread the load.
 """
 
-import json
 import os
 import shutil
-import tempfile
 import threading
-import time
-import uuid
 import webbrowser
+from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from sqlalchemy import select
 
+import appconfig
+import db
 import engine
+import jobqueue
+import settings
+import storage
+import worker
 
 ROOT = Path(__file__).parent
 STATIC = ROOT / "static"
-CONFIG_FILE = Path.home() / ".viral_clipper.json"
-DEFAULT_OUTPUT = Path.home() / "Desktop" / "viral_clips"
 
-# On RDP or a VPS set CLIPPER_HOST=0.0.0.0 to serve beyond localhost.
-HOST = os.environ.get("CLIPPER_HOST", "127.0.0.1")
-PORT = int(os.environ.get("CLIPPER_PORT", "8420"))
 
-STAGES = ["download", "transcribe", "score", "ready"]
+@asynccontextmanager
+async def lifespan(_app):
+    # Either process can be first to start, so both migrate. Alembic locks.
+    db.upgrade()
+    stop = worker.start_inline() if settings.INLINE_WORKER else None
+    try:
+        yield
+    finally:
+        if stop:
+            stop.set()
 
-app = FastAPI(title="Viral Clipper")
-jobs = {}
-jobs_lock = threading.Lock()
+
+app = FastAPI(title="Viral Clipper", lifespan=lifespan)
+
+
+# ---------- shaping rows for the dashboard ----------
+
+def clip_json(c):
+    return {
+        "n": c.n, "score": c.score, "title": c.title, "hook": c.hook,
+        "reason": c.reason, "text": c.text, "tags": c.tags or [],
+        "thumb": c.thumb, "start": c.start_s, "end": c.end_s,
+        "duration": c.duration,
+        "exporting": c.status == db.CLIP_EXPORTING,
+        "exported": c.status == db.CLIP_EXPORTED,
+        "percent": round(c.percent or 0),
+        "export_error": c.export_error,
+        "url": c.asset_url,
+    }
+
+
+def job_json(job, clips):
+    started = db.as_utc(job.started_at or job.created_at)
+    return {
+        "id": job.id, "url": job.url, "platform": job.platform,
+        "stage": job.stage, "status": job.status,
+        "message": job.message, "percent": round(job.percent or 0, 1),
+        "error": job.error, "clips": [clip_json(c) for c in clips],
+        "meta": job.meta or {}, "exporting": job.exporting,
+        "stages": db.STAGES,
+        "fetching_video": job.fetching_video,
+        "export_error": job.export_error,
+        "has_video": bool(job.video_path),
+        "elapsed": round((db.now() - started).total_seconds()),
+    }
+
+
+def read_job(jid):
+    with db.session() as s:
+        job = s.get(db.Job, jid)
+        if not job:
+            raise HTTPException(404, "That job is gone. Run the analysis again.")
+        clips = list(s.scalars(
+            select(db.Clip).where(db.Clip.job_id == jid).order_by(db.Clip.n)))
+        return job_json(job, clips)
 
 
 # ---------- config ----------
 
-def load_config():
-    base = {
-        "provider": "anthropic", "keys": {},
-        "transcriber": "groq", "whisper_model": "base",
-        "groq_model": "whisper-large-v3-turbo", "clip_len": 60,
-        "max_clips": 6, "cookies": "none", "cookies_file": "",
-        "captions": "punch", "vertical": True,
-        "blur_pad": True, "outdir": str(DEFAULT_OUTPUT),
-    }
-    if CONFIG_FILE.exists():
-        try:
-            saved = json.loads(CONFIG_FILE.read_text())
-            # Older configs stored a single Anthropic key at the top level.
-            if saved.get("api_key") and not saved.get("keys"):
-                saved["keys"] = {"anthropic": saved["api_key"]}
-            saved.pop("api_key", None)
-            base.update(saved)
-        except (json.JSONDecodeError, OSError):
-            pass
-    if base["provider"] not in engine.PROVIDERS:
-        base["provider"] = "anthropic"
-    if base["transcriber"] not in engine.TRANSCRIBERS:
-        base["transcriber"] = "groq"
-    if base["captions"] not in engine.CAPTION_STYLES:
-        base["captions"] = "punch"
-    return base
-
-
-def transcribe_model(cfg):
-    return cfg["groq_model"] if cfg["transcriber"] == "groq" else cfg["whisper_model"]
-
-
-def transcribe_key(cfg):
-    return (cfg.get("keys") or {}).get("groq", "") if cfg["transcriber"] == "groq" else ""
-
-
-def active_key(cfg):
-    return (cfg.get("keys") or {}).get(cfg["provider"], "")
-
-
-def save_config(patch):
-    current = load_config()
-    # Merge keys so saving one provider's key does not wipe the others.
-    incoming_keys = patch.pop("keys", None)
-    if incoming_keys:
-        merged = dict(current.get("keys") or {})
-        merged.update({k: v for k, v in incoming_keys.items() if v})
-        current["keys"] = merged
-    current.update(patch)
-    try:
-        CONFIG_FILE.write_text(json.dumps(current, indent=2))
-    except OSError:
-        pass
-    return current
-
-
-def redacted(cfg):
-    out = dict(cfg)
-    out["keys_set"] = {p: bool((cfg.get("keys") or {}).get(p))
-                       for p in list(engine.PROVIDERS) + ["groq"]}
-    out.pop("keys", None)
-    out["providers"] = {
-        p: {"label": v["label"], "model": v["model"],
-            "keys_url": v["keys_url"], "key_prefix": v["key_prefix"]}
-        for p, v in engine.PROVIDERS.items()
-    }
-    out["caption_styles"] = {
-        k: {"label": v["label"], "blurb": v["blurb"]}
-        for k, v in engine.CAPTION_STYLES.items()
-    }
-    out["transcribers"] = {
-        t: {"label": v["label"], "blurb": v["blurb"], "models": v["models"],
-            "needs_key": v["needs_key"], "keys_url": v["keys_url"]}
-        for t, v in engine.TRANSCRIBERS.items()
-    }
-    return out
-
-
-# ---------- job helpers ----------
-
-def new_job(url):
-    jid = uuid.uuid4().hex[:12]
-    with jobs_lock:
-        jobs[jid] = {
-            "id": jid, "url": url, "stage": "download", "status": "running",
-            "message": "Starting", "percent": 0, "error": None,
-            "clips": [], "meta": {}, "exporting": False,
-            "platform": engine.platform_of(url),
-            "temp": tempfile.mkdtemp(prefix="viralclip_"),
-            "video": None, "audio": None, "segments": [],
-            "fetching_video": False,
-            "export_error": None, "control": engine.Control(),
-            "started": time.time(),
-        }
-    return jobs[jid]
-
-
-def get_job(jid):
-    with jobs_lock:
-        job = jobs.get(jid)
-    if not job:
-        raise HTTPException(404, "That job is gone. Run the analysis again.")
-    return job
-
-
-def public_job(job):
-    return {
-        "id": job["id"], "url": job["url"], "platform": job["platform"],
-        "stage": job["stage"], "status": job["status"],
-        "message": job["message"], "percent": round(job["percent"], 1),
-        "error": job["error"], "clips": job["clips"], "meta": job["meta"],
-        "exporting": job["exporting"], "stages": STAGES,
-        "fetching_video": job.get("fetching_video", False),
-        "export_error": job.get("export_error"),
-        "has_video": bool(job.get("video")),
-        "elapsed": round(time.time() - job["started"]),
-    }
-
-
-def latest_job():
-    """Most recent job, so a page reload can rejoin a run already in flight."""
-    with jobs_lock:
-        if not jobs:
-            return None
-        return max(jobs.values(), key=lambda j: j["started"])
-
-
-# ---------- analysis pipeline ----------
-
-PIPELINE_ATTEMPTS = 3
-PERMANENT = ("api key was rejected", "needs a login", "signed-in session",
-             "no speech was found", "not a video page", "too large",
-             "is not installed")
-
-
-def run_pipeline(job, cfg):
-    """Retries itself on transient failures. Checkpoints make each retry cheap."""
-    for attempt in range(1, PIPELINE_ATTEMPTS + 1):
-        _run_pipeline_once(job, cfg)
-
-        if job["status"] != "error":
-            return
-        if job["control"].cancelled:
-            return
-
-        err = (job["error"] or "").lower()
-        if any(k in err for k in PERMANENT):
-            return                      # retrying will not change the answer
-        if attempt == PIPELINE_ATTEMPTS:
-            job["message"] = "Stopped after several tries"
-            return
-
-        job["status"] = "running"
-        job["message"] = f"Hit a snag, picking up where it left off ({attempt})"
-        job["error"] = None
-        time.sleep(3 * attempt)
-
-
-def _run_pipeline_once(job, cfg):
-    jid = job["id"]
-    temp = Path(job["temp"])
-    ctl = job["control"]
-
-    OPENING = {"download": "Looking up the video",
-               "transcribe": "Starting up the transcriber",
-               "score": "Preparing the transcript",
-               "ready": "Finishing up"}
-
-    def stage(name):
-        job["stage"] = name
-        job["percent"] = 0
-        job["message"] = OPENING.get(name, "Working")
-
-    def progress(msg, percent=None):
-        job["message"] = msg
-        if percent is not None:
-            job["percent"] = percent
-
-    try:
-        stage("download")
-        audio, meta = engine.download(
-            job["url"], temp, cfg["cookies"], progress, ctl,
-            cfg.get("cookies_file", ""), audio_only=True)
-        job["audio"] = str(audio)
-        job["meta"] = meta
-
-        stage("transcribe")
-        segments = engine.transcribe(
-            audio, cfg["transcriber"], transcribe_model(cfg),
-            transcribe_key(cfg), progress, ctl, job["url"])
-        if not segments:
-            raise RuntimeError(
-                "No speech was found in this video. This tool needs talking to work with.")
-
-        job["segments"] = segments
-
-        stage("score")
-        progress("Sending the transcript for scoring", 20)
-        clips = engine.score_moments(
-            segments, cfg["provider"], active_key(cfg), int(cfg["clip_len"]),
-            int(cfg["max_clips"]), progress, job["url"])
-        if not clips:
-            raise RuntimeError("No moments in this video were strong enough to clip.")
-
-        poster = meta.get("thumbnail") or ""
-        for c in clips:
-            c["thumb"] = poster
-
-        job["clips"] = clips
-        stage("ready")
-        job["status"] = "done"
-        job["percent"] = 100
-        job["message"] = f"{len(clips)} moments found"
-
-    except engine.Cancelled:
-        job["status"] = "cancelled"
-        job["message"] = "Run stopped"
-        job["percent"] = 0
-    except Exception as e:
-        job["status"] = "error"
-        job["error"] = str(e)
-        job["message"] = "Stopped"
-
-
-def ensure_video(job, cfg):
-    """Pull the picture only now that the user wants actual clips."""
-    if job.get("video") and Path(job["video"]).exists():
-        return job["video"]
-
-    ctl = job["control"]
-    job["fetching_video"] = True
-
-    def progress(msg, percent=None):
-        job["message"] = msg
-        if percent is not None:
-            job["percent"] = percent
-
-    try:
-        video, _ = engine.download(
-            job["url"], Path(job["temp"]), cfg["cookies"], progress, ctl,
-            cfg.get("cookies_file", ""), audio_only=False)
-        job["video"] = str(video)
-        return job["video"]
-    finally:
-        job["fetching_video"] = False
-
-
-def run_export(job, clip_numbers, cfg):
-    out = Path(cfg["outdir"])
-    out.mkdir(parents=True, exist_ok=True)
-    ctl = job["control"]
-    title_slug = engine.slugify(job["meta"].get("title", ""), 28)
-    picked = [c for c in job["clips"] if c["n"] in clip_numbers]
-    job["exporting"] = True
-
-    try:
-        video = ensure_video(job, cfg)
-    except engine.Cancelled:
-        job["exporting"] = False
-        job["message"] = "Export stopped"
-        return
-    except Exception as e:
-        job["exporting"] = False
-        job["export_error"] = str(e)
-        job["message"] = "Could not fetch the video"
-        return
-
-    for i, c in enumerate(picked, 1):
-        c["exporting"] = True
-        c["percent"] = 0
-        c.pop("export_error", None)
-        job["message"] = f"Exporting clip {i} of {len(picked)}"
-        name = f"{c['score']:02d}pct-{title_slug}-{engine.slugify(c['title'], 24)}.mp4"
-        dest = out / name
-        subs = None
-        if cfg["captions"] != "none" and job.get("segments"):
-            try:
-                subs = engine.build_ass(
-                    job["segments"], c["start"], c["end"], cfg["captions"],
-                    Path(job["temp"]) / f"caps{c['n']}.ass")
-            except OSError:
-                subs = None         # a clip without captions beats no clip
-
-        try:
-            engine.cut(video, c["start"], c["end"], dest,
-                       cfg["vertical"], cfg["blur_pad"],
-                       progress=lambda p, c=c: c.__setitem__("percent", round(p)),
-                       control=ctl, subs=subs)
-            c["exported"] = True
-            c["file"] = str(dest)
-        except engine.Cancelled:
-            c["exporting"] = False
-            job["exporting"] = False
-            job["message"] = "Export stopped"
-            return
-        except Exception as e:
-            c["export_error"] = str(e)
-        finally:
-            c["exporting"] = False
-
-    job["exporting"] = False
-
-    try:
-        lines = [
-            f"Source   : {job['url']}",
-            f"Title    : {job['meta'].get('title', '')}",
-            f"Platform : {job['platform']}",
-            "", "-" * 60, "",
-        ]
-        for c in picked:
-            lines += [
-                c.get("file", c["title"]),
-                f"  Score     : {c['score']}%",
-                f"  Timestamp : {engine.fmt_time(c['start'])} - {engine.fmt_time(c['end'])}",
-                f"  Length    : {c['duration']}s",
-                f"  Hook      : {c['hook']}",
-                f"  Why       : {c['reason']}",
-                "",
-            ]
-        (out / "clip-report.txt").write_text("\n".join(lines), encoding="utf-8")
-    except OSError:
-        pass
-
-    done = sum(1 for c in picked if c.get("exported"))
-    job["message"] = f"Exported {done} of {len(picked)} clips"
-
-
-# ---------- API ----------
-
-class AnalyzeBody(BaseModel):
-    url: str
-
-
-class ExportBody(BaseModel):
-    clips: list[int]
-
-
 @app.get("/api/config")
 def api_get_config():
-    return redacted(load_config())
+    return appconfig.redacted(appconfig.load_config())
 
 
 @app.post("/api/config")
@@ -399,22 +118,52 @@ def api_set_config(body: dict):
         raise HTTPException(400, "Unknown scoring provider.")
     if body.get("transcriber") and body["transcriber"] not in engine.TRANSCRIBERS:
         raise HTTPException(400, "Unknown transcription engine.")
-    return redacted(save_config(body))
+    return appconfig.redacted(appconfig.save_config(body))
 
 
 @app.get("/api/preflight")
 def api_preflight():
-    cfg = load_config()
+    cfg = appconfig.load_config()
     return {
         "yt_dlp": bool(shutil.which("yt-dlp")),
         "ffmpeg": bool(shutil.which("ffmpeg")),
-        "api_key": bool(active_key(cfg)),
+        "api_key": bool(appconfig.active_key(cfg)),
         "provider": cfg["provider"],
         "provider_label": engine.PROVIDERS[cfg["provider"]]["label"],
         "transcriber": cfg["transcriber"],
         "transcriber_ok": (not engine.TRANSCRIBERS[cfg["transcriber"]]["needs_key"]
-                           or bool(transcribe_key(cfg))),
+                           or bool(appconfig.transcribe_key(cfg))),
     }
+
+
+@app.get("/api/health")
+def api_health():
+    """What the machine is wired to, and whether work is moving."""
+    cutoff = db.now() - timedelta(seconds=settings.STALE_AFTER_SECONDS)
+    with db.session() as s:
+        running = list(s.scalars(
+            select(db.Job).where(db.Job.status == db.RUNNING)))
+        live = [j.claimed_by for j in running
+                if db.as_utc(j.heartbeat_at) and db.as_utc(j.heartbeat_at) > cutoff]
+    out = dict(settings.summary())
+    out.update({
+        "queued": jobqueue.queued_count(),
+        "running": len(running),
+        "redis_reachable": jobqueue.redis_ok(),
+        "signals_waiting": jobqueue.depth(),
+        "live_workers": sorted(set(w for w in live if w)),
+    })
+    return out
+
+
+# ---------- jobs ----------
+
+class AnalyzeBody(BaseModel):
+    url: str
+
+
+class ExportBody(BaseModel):
+    clips: list[int]
 
 
 @app.post("/api/analyze")
@@ -423,66 +172,129 @@ def api_analyze(body: AnalyzeBody):
     if not url.startswith(("http://", "https://")):
         raise HTTPException(400, "That does not look like a video link.")
 
-    cfg = load_config()
-    if not active_key(cfg):
+    cfg = appconfig.load_config()
+    if not appconfig.active_key(cfg):
         label = engine.PROVIDERS[cfg["provider"]]["label"]
         raise HTTPException(400, f"Add your {label} API key in Settings first.")
     spec = engine.TRANSCRIBERS[cfg["transcriber"]]
-    if spec["needs_key"] and not transcribe_key(cfg):
+    if spec["needs_key"] and not appconfig.transcribe_key(cfg):
         raise HTTPException(400, f"Add your {spec['label']} API key in Settings first.")
     for tool, hint in [("yt-dlp", "pip install yt-dlp"),
                        ("ffmpeg", "install ffmpeg and add it to PATH")]:
         if not shutil.which(tool):
             raise HTTPException(400, f"{tool} is missing. To fix: {hint}")
 
-    job = new_job(url)
-    threading.Thread(target=run_pipeline, args=(job, cfg), daemon=True).start()
-    return public_job(job)
+    with db.session() as s:
+        job = db.Job(url=url, platform=engine.platform_of(url),
+                     task=db.TASK_ANALYZE, status=db.QUEUED,
+                     message="Queued", stage="download")
+        s.add(job)
+        s.flush()
+        jid = job.id
+    jobqueue.enqueue(jid, db.TASK_ANALYZE)
+    return read_job(jid)
 
 
 @app.get("/api/job/{jid}")
 def api_job(jid: str):
-    return public_job(get_job(jid))
+    return read_job(jid)
 
 
 @app.get("/api/active")
 def api_active():
-    """Lets a reloaded page rejoin whatever run is already going."""
-    job = latest_job()
-    return public_job(job) if job else {}
+    """Lets a reloaded page rejoin whatever run is already going.
+
+    Anything in flight counts whatever its age; finished runs only for a day,
+    so a reload next week does not reopen last week's library.
+    """
+    fresh = db.now() - timedelta(hours=24)
+    with db.session() as s:
+        job = s.scalars(
+            select(db.Job)
+            .where(db.Job.status.in_([db.QUEUED, db.RUNNING]))
+            .order_by(db.Job.created_at.desc()).limit(1)).first()
+        if not job:
+            job = s.scalars(
+                select(db.Job).where(db.Job.created_at > fresh)
+                .order_by(db.Job.created_at.desc()).limit(1)).first()
+        if not job:
+            return {}
+        clips = list(s.scalars(
+            select(db.Clip).where(db.Clip.job_id == job.id).order_by(db.Clip.n)))
+        return job_json(job, clips)
+
+
+@app.get("/api/jobs")
+def api_jobs(limit: int = 25):
+    """Run history. Nothing calls this yet; it is what the DB bought us."""
+    limit = max(1, min(limit, 100))
+    with db.session() as s:
+        jobs = list(s.scalars(
+            select(db.Job).order_by(db.Job.created_at.desc()).limit(limit)))
+        counts = {}
+        if jobs:
+            rows = s.execute(
+                select(db.Clip.job_id, db.Clip.status)
+                .where(db.Clip.job_id.in_([j.id for j in jobs]))).all()
+            for job_id, status in rows:
+                c = counts.setdefault(job_id, {"clips": 0, "exported": 0})
+                c["clips"] += 1
+                if status == db.CLIP_EXPORTED:
+                    c["exported"] += 1
+        return [{
+            "id": j.id, "url": j.url, "platform": j.platform,
+            "title": (j.meta or {}).get("title", ""),
+            "status": j.status, "stage": j.stage,
+            "created_at": db.as_utc(j.created_at).isoformat(),
+            "clips": counts.get(j.id, {}).get("clips", 0),
+            "exported": counts.get(j.id, {}).get("exported", 0),
+        } for j in jobs]
 
 
 @app.post("/api/job/{jid}/cancel")
 def api_cancel(jid: str):
-    job = get_job(jid)
-    job["control"].cancel()
-    if job["status"] == "running":
-        job["status"] = "cancelled"
-        job["message"] = "Run stopped"
-    job["exporting"] = False
+    with db.session() as s:
+        job = s.get(db.Job, jid)
+        if not job:
+            raise HTTPException(404, "That job is gone. Run the analysis again.")
+        # A job still waiting has no worker to tell, so stop it here.
+        if job.status == db.QUEUED:
+            job.status = db.CANCELLED
+            job.message = "Run stopped"
+            job.exporting = False
+            return {"ok": True}
+    jobqueue.request_cancel(jid)
     return {"ok": True}
 
 
 @app.post("/api/job/{jid}/export")
 def api_export(jid: str, body: ExportBody):
-    job = get_job(jid)
-    if job["stage"] != "ready":
-        raise HTTPException(400, "This video is still being analysed.")
     if not body.clips:
         raise HTTPException(400, "Pick at least one clip.")
-
-    # A cancelled analysis leaves a tripped token behind; reset it to export.
-    job["control"] = engine.Control()
-    cfg = load_config()
-    threading.Thread(target=run_export, args=(job, set(body.clips), cfg),
-                     daemon=True).start()
+    with db.session() as s:
+        job = s.get(db.Job, jid)
+        if not job:
+            raise HTTPException(404, "That job is gone. Run the analysis again.")
+        if job.stage != "ready":
+            raise HTTPException(400, "This video is still being analysed.")
+        if job.exporting:
+            raise HTTPException(400, "That export is already running.")
+        job.export_request = sorted(set(body.clips))
+        job.export_error = None
+        job.cancel_requested = False
+    jobqueue.enqueue(jid, db.TASK_EXPORT)
     return {"ok": True}
 
 
+# ---------- media ----------
+
 @app.get("/api/thumb/{jid}/{n}")
 def api_thumb(jid: str, n: int):
-    job = get_job(jid)
-    path = Path(job["temp"]) / "thumbs" / f"{n}.jpg"
+    with db.session() as s:
+        job = s.get(db.Job, jid)
+    if not job or not job.temp_dir:
+        raise HTTPException(404, "No preview")
+    path = Path(job.temp_dir) / "thumbs" / f"{n}.jpg"
     if not path.exists():
         raise HTTPException(404, "No preview")
     return FileResponse(path, media_type="image/jpeg")
@@ -492,23 +304,29 @@ def api_thumb(jid: str, n: int):
 def api_preview(jid: str, n: int):
     """Audio of a clip, cut from the file analysis already downloaded.
 
-    Lets you hear a moment before committing to the full video download.
+    Reads the worker's scratch folder, so this answers only while the API and
+    the worker that ran the job share a filesystem. On a split deployment it
+    404s rather than lying, and the clip itself still comes from storage.
     """
-    job = get_job(jid)
-    clip = next((c for c in job["clips"] if c["n"] == n), None)
+    with db.session() as s:
+        job = s.get(db.Job, jid)
+        if not job:
+            raise HTTPException(404, "That job is gone. Run the analysis again.")
+        clip = s.scalars(select(db.Clip).where(
+            db.Clip.job_id == jid, db.Clip.n == n)).first()
     if not clip:
         raise HTTPException(404, "No such clip.")
-    if not job.get("audio") or not Path(job["audio"]).exists():
+    if not job.audio_path or not Path(job.audio_path).exists():
         raise HTTPException(404, "The audio for this run is no longer around.")
 
-    out = Path(job["temp"]) / "previews"
+    out = Path(job.temp_dir or ".") / "previews"
     out.mkdir(parents=True, exist_ok=True)
     piece = out / f"{n}.mp3"
 
     if not piece.exists():
         proc = engine._run([
-            "ffmpeg", "-y", "-ss", str(clip["start"]), "-i", job["audio"],
-            "-t", str(clip["end"] - clip["start"]),
+            "ffmpeg", "-y", "-ss", str(clip.start_s), "-i", job.audio_path,
+            "-t", str(clip.end_s - clip.start_s),
             "-ac", "1", "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "96k",
             str(piece)])
         if proc.returncode != 0 or not piece.exists():
@@ -519,21 +337,48 @@ def api_preview(jid: str, n: int):
 
 @app.get("/api/clip/{jid}/{n}")
 def api_clip(jid: str, n: int):
-    job = get_job(jid)
-    clip = next((c for c in job["clips"] if c["n"] == n), None)
-    if not clip or not clip.get("file"):
+    """The rendered file: from disk where it still is, otherwise from storage."""
+    with db.session() as s:
+        clip = s.scalars(select(db.Clip).where(
+            db.Clip.job_id == jid, db.Clip.n == n)).first()
+    if not clip or clip.status != db.CLIP_EXPORTED:
         raise HTTPException(404, "That clip has not been exported yet.")
-    path = Path(clip["file"])
-    if not path.exists():
-        raise HTTPException(404, "The clip file was moved or deleted.")
-    return FileResponse(path, media_type="video/mp4", filename=path.name)
+
+    if clip.file_path and Path(clip.file_path).exists():
+        path = Path(clip.file_path)
+        return FileResponse(path, media_type="video/mp4", filename=path.name)
+
+    if clip.asset_key:
+        store = storage.backend()
+        local = store.local_path(clip.asset_key)
+        if local:
+            return FileResponse(local, media_type="video/mp4",
+                                filename=Path(clip.asset_key).name)
+        return RedirectResponse(store.url(clip.asset_key))
+
+    raise HTTPException(404, "The clip file was moved or deleted.")
+
+
+@app.get("/api/media/{key:path}")
+def api_media(key: str):
+    """Serves objects held by the local storage backend."""
+    store = storage.backend()
+    if store.name != "local":
+        raise HTTPException(404, "Not served from here.")
+    try:
+        path = store.local_path(key)
+    except ValueError:
+        raise HTTPException(400, "Bad key.")
+    if not path:
+        raise HTTPException(404, "No such object.")
+    return FileResponse(path, media_type=storage.guess_type(path))
 
 
 @app.post("/api/reveal")
 def api_reveal():
     import subprocess
     import sys
-    out = Path(load_config()["outdir"])
+    out = Path(appconfig.load_config()["outdir"])
     out.mkdir(parents=True, exist_ok=True)
     try:
         if sys.platform == "win32":
@@ -557,11 +402,20 @@ app.mount("/", StaticFiles(directory=STATIC, html=True), name="static")
 
 if __name__ == "__main__":
     import uvicorn
-    local = f"http://127.0.0.1:{PORT}"
+    local = f"http://127.0.0.1:{settings.PORT}"
+    info = settings.summary()
     print(f"\n  Viral Clipper running at {local}")
-    if HOST != "127.0.0.1":
-        print(f"  Also reachable on this machine's network address at port {PORT}")
+    print(f"  database {info['database_kind']}, storage {info['storage']}, "
+          f"redis {'on' if info['redis'] else 'off'}")
+    if settings.INLINE_WORKER:
+        print("  worker running in this process "
+              "(set CLIPPER_INLINE_WORKER=0 to run worker.py separately)")
+    else:
+        print("  no inline worker. Start one with: python worker.py")
+    if settings.HOST != "127.0.0.1":
+        print(f"  Also reachable on this machine's network address at port "
+              f"{settings.PORT}")
     print()
-    if HOST == "127.0.0.1":
+    if settings.HOST == "127.0.0.1":
         threading.Timer(1.2, lambda: webbrowser.open(local)).start()
-    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+    uvicorn.run(app, host=settings.HOST, port=settings.PORT, log_level="warning")

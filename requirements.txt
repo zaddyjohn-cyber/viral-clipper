@@ -4,3 +4,18 @@ pydantic>=2.9
 anthropic>=0.40
 yt-dlp>=2024.10.22
 openai-whisper>=20240930
+
+# State: jobs, clips, accounts, posts, metrics
+SQLAlchemy>=2.0
+alembic>=1.13
+
+# Postgres driver. Not needed while DATABASE_URL is unset and the SQLite
+# fallback is in use, but required for any real deployment.
+psycopg[binary]>=3.2
+
+# Queue doorbell. Optional: without it workers poll the database instead.
+redis>=5.0
+
+# Object storage for rendered clips, and encryption for account tokens
+boto3>=1.34
+cryptography>=42
