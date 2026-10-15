@@ -56,6 +56,7 @@ app = FastAPI(title="Viral Clipper", lifespan=lifespan)
 def clip_json(c):
     return {
         "n": c.n, "score": c.score, "title": c.title, "hook": c.hook,
+        "hook_card": c.hook_card,
         "reason": c.reason, "text": c.text, "tags": c.tags or [],
         "thumb": c.thumb, "start": c.start_s, "end": c.end_s,
         "duration": c.duration,

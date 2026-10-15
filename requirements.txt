@@ -5,6 +5,12 @@ anthropic>=0.40
 yt-dlp>=2024.10.22
 openai-whisper>=20240930
 
+# Face detection for the speaker-tracking reframe. Without these an export
+# still works, it just falls back to the blurred fill. The detector weights
+# are the file in models/.
+opencv-python>=4.9
+numpy>=1.26
+
 # State: jobs, clips, accounts, posts, metrics
 SQLAlchemy>=2.0
 alembic>=1.13

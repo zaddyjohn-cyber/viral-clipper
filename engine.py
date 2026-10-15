@@ -367,6 +367,51 @@ def extract_audio(video_path, out_path, control=NOOP, start=None, span=None):
     return out_path
 
 
+def _clean_words(raw, offset=0.0):
+    """Normalise word timings to {start,end,word}, dropping anything unusable.
+
+    Both back ends can hand back a word with no text, or with an end before
+    its start. Captions key every pop off these times, so one bad entry is
+    worth more than it costs to throw away.
+    """
+    out = []
+    for w in raw or []:
+        if isinstance(w, dict):
+            word, a, b = w.get("word"), w.get("start"), w.get("end")
+        else:
+            word, a, b = (getattr(w, "word", None), getattr(w, "start", None),
+                          getattr(w, "end", None))
+        word = (word or "").strip()
+        if not word or a is None or b is None:
+            continue
+        try:
+            a, b = float(a) + offset, float(b) + offset
+        except (TypeError, ValueError):
+            continue
+        if b <= a:
+            b = a + 0.08
+        out.append({"start": a, "end": b, "word": word})
+    return out
+
+
+def _attach_words(segments, words):
+    """Groq reports words for the whole chunk, so hand each one to its line."""
+    if not words:
+        return
+    i = 0
+    for sg in segments:
+        mine = []
+        while i < len(words) and words[i]["end"] <= sg["start"] + 0.01:
+            i += 1                      # a word that ended before this line
+        j = i
+        while j < len(words) and words[j]["start"] < sg["end"]:
+            mine.append(words[j])
+            j += 1
+        if mine:
+            sg["words"] = mine
+            i = j
+
+
 def _transcribe_local(video_path, model_name, progress, control=NOOP):
     progress("Loading the speech engine", 0)
     try:
@@ -384,6 +429,7 @@ def _transcribe_local(video_path, model_name, progress, control=NOOP):
     control.check()
     progress("Reading audio", 1)
     stream, info = model.transcribe(str(video_path), beam_size=1, vad_filter=True,
+                                    word_timestamps=True,
                                     condition_on_previous_text=False)
 
     total = info.duration or probe_duration(video_path) or 1
@@ -392,7 +438,11 @@ def _transcribe_local(video_path, model_name, progress, control=NOOP):
         control.check()
         text = seg.text.strip()
         if text:
-            out.append({"start": seg.start, "end": seg.end, "text": text})
+            line = {"start": seg.start, "end": seg.end, "text": text}
+            words = _clean_words(getattr(seg, "words", None) or [])
+            if words:
+                line["words"] = words
+            out.append(line)
         progress(f"Transcribed {fmt_time(seg.end)} of {fmt_time(total)}",
                  min(99, seg.end / total * 100))
 
@@ -430,6 +480,7 @@ def _transcribe_groq(video_path, model_name, api_key, progress, control=NOOP, ur
 
     starts = [s for s in range(0, max(1, int(total)), GROQ_CHUNK_SECONDS)]
     out = []
+    want_words = {"yes": True}      # cleared if the endpoint refuses the ask
 
     # Each chunk is saved the moment it lands, so a dropped connection costs
     # one chunk rather than the whole transcript.
@@ -471,14 +522,17 @@ def _transcribe_groq(video_path, model_name, api_key, progress, control=NOOP, ur
             control.check()
             note = "" if attempt == 1 else f", retry {attempt - 1}"
             progress(f"Transcribing {label}{note}", base + step * 0.35)
+            form = {"model": model_name, "response_format": "verbose_json",
+                    "temperature": "0"}
+            if want_words["yes"]:
+                form["timestamp_granularities[]"] = ["segment", "word"]
             try:
                 with open(piece, "rb") as fh:
                     res = httpx.post(
                         GROQ_URL,
                         headers={"Authorization": f"Bearer {api_key}"},
                         files={"file": (piece.name, fh, "audio/mpeg")},
-                        data={"model": model_name, "response_format": "verbose_json",
-                              "temperature": "0"},
+                        data=form,
                         timeout=600.0)
             except httpx.HTTPError as e:
                 # A dropped upload is normal on a weak line, so keep trying.
@@ -488,6 +542,14 @@ def _transcribe_groq(video_path, model_name, api_key, progress, control=NOOP, ur
                         f"Lost the connection to Groq {GROQ_ATTEMPTS} times while "
                         f"sending {label}. Last error: {e}")
                 time.sleep(2 ** attempt)
+                continue
+
+            # Not every model on the endpoint serves word timings. Losing the
+            # pop on each caption word is not worth losing the transcript, so
+            # drop the ask and carry on without them.
+            if (res.status_code == 400 and want_words["yes"]
+                    and "granularit" in res.text.lower()):
+                want_words["yes"] = False
                 continue
 
             # A dropped upload reaches Groq as a truncated, unreadable file,
@@ -512,7 +574,8 @@ def _transcribe_groq(video_path, model_name, api_key, progress, control=NOOP, ur
             raise RuntimeError(f"Groq returned {res.status_code}. {res.text[:200]}")
 
         try:
-            segments = res.json().get("segments") or []
+            body = res.json()
+            segments = body.get("segments") or []
         except json.JSONDecodeError:
             raise RuntimeError("Groq sent back a response that could not be read.")
 
@@ -522,6 +585,7 @@ def _transcribe_groq(video_path, model_name, api_key, progress, control=NOOP, ur
             if text:
                 got.append({"start": seg["start"] + start,
                             "end": seg["end"] + start, "text": text})
+        _attach_words(got, _clean_words(body.get("words"), start))
         out += got
 
         if url:
@@ -616,6 +680,29 @@ def _call_openai_compatible(prompt, api_key, model, base_url):
         raise RuntimeError("The scoring API sent back an unexpected response.")
 
 
+HOOK_CARD_WORDS = 6
+HOOK_CARD_CHARS = 38
+
+
+def _hook_card(clip):
+    """The written hook, trimmed to something that fits across the top.
+
+    Models pad these out given half a chance, and a card that wraps to three
+    lines covers the speaker's face, so the length is enforced here rather
+    than hoped for in the prompt.
+    """
+    text = (clip.get("hook_card") or clip.get("title") or "").strip()
+    text = re.sub(r"\s+", " ", text.strip(" \"'`*#.,!?-"))
+    if not text:
+        return ""
+    words = text.split()[:HOOK_CARD_WORDS]
+    out = " ".join(words)
+    while len(out) > HOOK_CARD_CHARS and len(words) > 2:
+        words.pop()
+        out = " ".join(words)
+    return out[:HOOK_CARD_CHARS].strip()
+
+
 def score_moments(segments, provider, api_key, clip_len, max_clips, progress, url=""):
     """Scores moments by line number.
 
@@ -663,8 +750,10 @@ Score viral potential 0 to 100 and be honest. Reserve 85 and above for clips you
 
 Also give a title of 3 to 6 words, a reason of at most 16 words, and 1 to 3 tags from: hook, story, emotion, insight, conflict, humor, data, howto, reveal.
 
+Write a hook_card as well: 3 to 6 words that get burned across the top of the screen for the first second and a half. This is yours to write, not a quote. Make it the promise that stops the scroll: a stake, a number, a contradiction or an open loop the clip then closes. No hashtags, no emoji, no end punctuation, no quotation marks.
+
 Respond with raw JSON only, no markdown fence:
-{{"clips":[{{"start_line":412,"end_line":436,"viral_score":87,"title":"The hiring mistake","hook":"exact text of line 412","reason":"why it performs","tags":["insight","story"]}}]}}"""
+{{"clips":[{{"start_line":412,"end_line":436,"viral_score":87,"title":"The hiring mistake","hook":"exact text of line 412","hook_card":"He hired the wrong guy twice","reason":"why it performs","tags":["insight","story"]}}]}}"""
 
     if provider == "anthropic":
         text = _call_anthropic(prompt, api_key, spec["model"])
@@ -714,6 +803,7 @@ Respond with raw JSON only, no markdown fence:
             "score": max(0, min(100, int(c.get("viral_score", 0)))),
             "title": (c.get("title") or f"Moment {len(clean) + 1}")[:70],
             "hook": segments[a]["text"][:160],
+            "hook_card": _hook_card(c),
             "text": " ".join(sg["text"] for sg in segments[a:b + 1])[:1400],
             "reason": (c.get("reason") or "")[:140],
             "tags": [t for t in (c.get("tags") or [])[:3] if isinstance(t, str)],
@@ -741,14 +831,16 @@ CAPTION_STYLES = {
         "blurb": "Big white caps with a heavy black stroke. The default look on Shorts.",
         "font": "Arial Black", "size": 92, "primary": "&H00FFFFFF",
         "outline": "&H00000000", "back": "&H00000000", "border": 1,
-        "outline_w": 7, "shadow": 3, "upper": True, "margin_v": 300,
+        "outline_w": 7, "shadow": 3, "upper": True, "margin_v": 420,
+        "accent": "&H0000F0FF",
     },
     "pop": {
         "label": "Pop",
         "blurb": "Yellow on black outline. Reads well over busy footage.",
         "font": "Arial Black", "size": 88, "primary": "&H0000F0FF",
         "outline": "&H00000000", "back": "&H00000000", "border": 1,
-        "outline_w": 6, "shadow": 2, "upper": True, "margin_v": 300,
+        "outline_w": 6, "shadow": 2, "upper": True, "margin_v": 420,
+        "accent": "&H00FFFFFF",
     },
     "clean": {
         "label": "Clean",
@@ -757,11 +849,44 @@ CAPTION_STYLES = {
         # BorderStyle 3 draws the box, and its padding comes from Outline,
         # so that has to be non-zero or the band never appears.
         "outline": "&H00000000", "back": "&HB0000000", "border": 3,
-        "outline_w": 14, "shadow": 0, "upper": False, "margin_v": 280,
+        "outline_w": 14, "shadow": 0, "upper": False, "margin_v": 400,
+        "accent": "&H0066E0FF",
     },
 }
 
 CAPTION_WORDS = 4          # short lines read faster on a phone
+
+# Word-level captions. Two to four words at a time is the short-form norm:
+# enough to read in one glance, few enough that the next one lands before
+# attention wanders.
+CAPTION_GROUP_MAX = 4
+CAPTION_GROUP_MIN = 2
+# Arial Black at the sizes these styles use fits about eighteen characters
+# across a 1080 frame once the side margins are taken off. Past that the line
+# wraps, and a two-line caption covers the chin of whoever is talking.
+CAPTION_GROUP_CHARS = 18
+CAPTION_GROUP_GAP = 0.45   # a pause this long ends the line
+CAPTION_GROUP_SPAN = 2.4   # and so does holding one line this long
+CAPTION_TAIL = 0.2         # how long the finished line stays up
+
+CAPTION_POP = 118          # percent scale a word lands at
+CAPTION_SETTLE = 130       # ms it takes to settle back to 100
+
+# Phone chrome: the caption, handle, button rail and progress bar all live in
+# the bottom fifth of a 1920-tall frame, and the top eighth holds the search
+# and follow row. Nothing we burn in is allowed inside either.
+CAPTION_SAFE_V = 420
+CAPTION_SAFE_H = 130
+
+# The written hook, burned across the top third for the first moment or two.
+HOOK_SECONDS = 1.5
+HOOK_STYLE = {
+    "font": "Arial Black", "size": 82, "primary": "&H00FFFFFF",
+    # BorderStyle 3 fills a box behind the text; libass takes that fill from
+    # the outline colour and the padding from its width, so both are set.
+    "outline": "&H28101010", "back": "&H28101010", "border": 3,
+    "outline_w": 18, "shadow": 0, "margin_v": 300,
+}
 
 
 def _ass_time(t):
@@ -794,12 +919,159 @@ def _caption_lines(segments, start, end):
     return out
 
 
-def build_ass(segments, start, end, style_name, out_path, width=1080, height=1920):
+def _ass_text(s):
+    """Strip anything libass would read as an override block."""
+    return (str(s or "").replace("\\", "").replace("{", "(")
+            .replace("}", ")").replace("\n", " ").strip())
+
+
+def _ass_colour(c):
+    """Inline colour tags need the closing ampersand the style fields omit."""
+    c = (c or "").strip()
+    return c if c.endswith("&") else c + "&"
+
+
+def _clip_words(segments, start, end):
+    """Word timings inside the clip, clip-relative.
+
+    Whisper reports a word at a time when asked, which is what the captions
+    are keyed off. A transcript from before that was turned on, or from a
+    back end that will not serve it, still has to produce captions, so the
+    words are spread evenly across their line instead.
+    """
+    out = []
+    span = end - start
+    for sg in segments:
+        if sg["end"] <= start or sg["start"] >= end:
+            continue
+        words = sg.get("words") or []
+        if words:
+            for w in words:
+                a = w["start"] - start
+                b = w["end"] - start
+                if b <= 0 or a >= span:
+                    continue
+                text = _ass_text(w["word"])
+                if text:
+                    out.append((max(0.0, a), min(span, b), text))
+            continue
+
+        pieces = [_ass_text(p) for p in (sg.get("text") or "").split()]
+        pieces = [p for p in pieces if p]
+        if not pieces:
+            continue
+        a = max(sg["start"], start) - start
+        b = min(sg["end"], end) - start
+        if b - a < 0.08:
+            continue
+        step = (b - a) / len(pieces)
+        for i, piece in enumerate(pieces):
+            out.append((a + i * step, a + (i + 1) * step, piece))
+
+    out.sort(key=lambda w: w[0])
+    return out
+
+
+def _group_words(words):
+    """Break the word stream into the two to four word lines that go up."""
+    groups, current = [], []
+
+    def flush():
+        if current:
+            groups.append(list(current))
+            current.clear()
+
+    for a, b, text in words:
+        if current:
+            gap = a - current[-1][1]
+            chars = sum(len(w[2]) for w in current) + len(current) + len(text)
+            long_enough = len(current) >= CAPTION_GROUP_MIN
+            if (len(current) >= CAPTION_GROUP_MAX
+                    or (long_enough and gap > CAPTION_GROUP_GAP)
+                    or (long_enough and b - current[0][0] > CAPTION_GROUP_SPAN)
+                    or chars > CAPTION_GROUP_CHARS):
+                flush()
+            # A sentence that ended wants the next line to itself.
+            elif long_enough and re.search(r"[.!?]$", current[-1][2]):
+                flush()
+        current.append((a, b, text))
+    flush()
+    return groups
+
+
+def _word_events(groups, st):
+    """One event per word: the whole line, with the word that just landed popped.
+
+    Showing the finished line and animating only the live word keeps the text
+    from reflowing under the reader, which is what makes word-by-word captions
+    feel jumpy when each word is drawn on its own.
+    """
+    accent = _ass_colour(st.get("accent") or st.get("primary"))
+    events = []
+    for g, group in enumerate(groups):
+        tail = group[-1][1] + CAPTION_TAIL
+        if g + 1 < len(groups):
+            tail = min(tail, groups[g + 1][0][0])
+        for i, (a, _b, _w) in enumerate(group):
+            stop = group[i + 1][0] if i + 1 < len(group) else tail
+            if stop - a < 0.02:
+                continue
+            parts = []
+            for j, (_, _, word) in enumerate(group):
+                word = word.upper() if st.get("upper") else word
+                if j == i:
+                    parts.append(
+                        "{" + rf"\1c{accent}\fscx{CAPTION_POP}\fscy{CAPTION_POP}"
+                        rf"\t(0,{CAPTION_SETTLE},\fscx100\fscy100)" + "}"
+                        + word + r"{\r}")
+                else:
+                    parts.append(word)
+            events.append((a, stop, " ".join(parts)))
+    return events
+
+
+def _style_line(name, st, align, margin_v, margin_h):
+    return (f"Style: {name},{st['font']},{st['size']},{st['primary']},"
+            f"&H000000FF,{st['outline']},{st['back']},-1,0,0,0,100,100,0,0,"
+            f"{st['border']},{st['outline_w']},{st['shadow']},{align},"
+            f"{margin_h},{margin_h},{margin_v},1")
+
+
+def build_ass(segments, start, end, style_name, out_path, width=1080, height=1920,
+              hook_card="", word_level=True):
+    """Write the subtitle file burned over a clip: captions, hook card, or both."""
     st = CAPTION_STYLES.get(style_name)
-    if not st or style_name == "none":
+    captions = bool(st) and style_name != "none"
+    hook = _ass_text(hook_card)[:HOOK_CARD_CHARS]
+    if not captions and not hook:
         return None
-    lines = _caption_lines(segments, start, end)
-    if not lines:
+
+    styles, body = [], []
+
+    if captions:
+        margin_v = max(int(st.get("margin_v") or 0), CAPTION_SAFE_V)
+        styles.append(_style_line("Cap", st, 2, margin_v, CAPTION_SAFE_H))
+        if word_level:
+            events = _word_events(_group_words(_clip_words(segments, start, end)), st)
+        else:
+            events = [(a, b, _ass_text(t).upper() if st.get("upper")
+                       else _ass_text(t))
+                      for a, b, t in _caption_lines(segments, start, end)]
+        for a, b, text in events:
+            if text:
+                body.append(
+                    f"Dialogue: 0,{_ass_time(a)},{_ass_time(b)},Cap,,0,0,0,,{text}")
+
+    if hook:
+        styles.append(_style_line("Hook", HOOK_STYLE, 8,
+                                  HOOK_STYLE["margin_v"], 160))
+        # Layer 1 so it sits over a caption if one happens to run under it.
+        body.append(
+            f"Dialogue: 1,{_ass_time(0)},{_ass_time(HOOK_SECONDS)},Hook,,0,0,0,,"
+            + "{" + r"\fad(140,260)\fscx84\fscy84\t(0,200,\fscx100\fscy100)" + "}"
+            + hook.upper())
+
+    if not body:
         return None
 
     head = f"""[Script Info]
@@ -811,20 +1083,11 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
-Style: Cap,{st['font']},{st['size']},{st['primary']},&H000000FF,{st['outline']},{st['back']},-1,0,0,0,100,100,0,0,{st['border']},{st['outline_w']},{st['shadow']},2,90,90,{st['margin_v']},1
+{chr(10).join(styles)}
 
 [Events]
 Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
 """
-
-    body = []
-    for a, b, text in lines:
-        if st["upper"]:
-            text = text.upper()
-        text = (text.replace("\\", "").replace("{", "(").replace("}", ")")
-                    .replace("\n", " "))
-        body.append(f"Dialogue: 0,{_ass_time(a)},{_ass_time(b)},Cap,,0,0,0,,{text}")
-
     out_path.write_text(head + "\n".join(body) + "\n", encoding="utf-8")
     return out_path
 
@@ -842,14 +1105,368 @@ def _ass_filter(path):
     return "ass='" + p + "'"
 
 
+# ---------- speaker-tracking reframe ----------
+
+# YuNet: one small ONNX file, a few milliseconds a frame on a plain CPU, and
+# no runtime to install beside it. The file lives next to the code so a box
+# with no outbound network still reframes; the download is only there for a
+# checkout that arrived without it.
+FACE_MODEL_NAME = "face_detection_yunet_2023mar.onnx"
+FACE_MODEL_URL = ("https://github.com/opencv/opencv_zoo/raw/main/models/"
+                  "face_detection_yunet/" + FACE_MODEL_NAME)
+FACE_MODEL_DIRS = [Path(__file__).resolve().parent / "models",
+                   Path.home() / ".viral_clipper" / "models"]
+
+FACE_FPS = 6              # detection rate, nothing to do with the output
+FACE_WIDTH = 480          # detection runs on a small copy of the picture
+FACE_SCORE = 0.6
+FACE_COVERAGE = 0.3       # below this share of frames with a face, do not try
+
+# The crop window chases the face rather than following it exactly: a window
+# that tracks every small head movement reads as a handheld camera.
+TRACK_CHASE = 0.3         # share of the remaining distance per sample
+TRACK_DEADZONE = 0.03     # of source width; smaller drifts are ignored
+TRACK_MAX_STEP = 0.045    # of source width per sample, so pans stay slow
+TRACK_CUT = 0.2           # a target this far off is a camera cut, so jump
+TRACK_KEY_STEP = 0.003    # of source width; smaller moves need no keyframe
+TRACK_MAX_KEYS = 110      # keeps the filter expression a sane length
+TRACK_SHARE = 12.0        # share of the export progress bar detection owns
+
+# Telling two people apart by how much their mouths move is crude, so the
+# frame has to be slow to change its mind: the other face has to move a good
+# deal more, for several samples running, and never twice in quick succession.
+SPEAKER_HOLD = 1.1        # seconds a face keeps the frame before it may move
+SPEAKER_LEAD = 1.35       # how much more the other mouth has to be moving
+SPEAKER_SUSTAIN = 3       # samples it has to keep that lead
+
+
+def _face_model():
+    """Path to the detector weights, fetching them once if they are missing."""
+    for d in FACE_MODEL_DIRS:
+        f = d / FACE_MODEL_NAME
+        if f.is_file():
+            return f
+
+    target = FACE_MODEL_DIRS[-1] / FACE_MODEL_NAME
+    try:
+        import urllib.request
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(FACE_MODEL_URL, timeout=60) as r:
+            data = r.read()
+        if len(data) < 100_000:         # a proxy's error page, not the model
+            return None
+        part = target.with_suffix(".part")
+        part.write_bytes(data)
+        part.replace(target)
+        return target
+    except (OSError, ValueError):
+        return None
+
+
+def video_size(path):
+    proc = _run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height",
+                 "-of", "csv=p=0:s=x", str(path)])
+    try:
+        w, h = proc.stdout.strip().splitlines()[0].split("x")
+        return int(w), int(h)
+    except (IndexError, ValueError):
+        return 0, 0
+
+
+def _crop_box(iw, ih):
+    """The largest 9:16 window that fits inside the source frame."""
+    if iw * 16 <= ih * 9:
+        cw, ch = iw, int(iw * 16 / 9)
+    else:
+        ch, cw = ih, int(ih * 9 / 16)
+    return min(iw, cw - cw % 2), min(ih, ch - ch % 2)
+
+
+def _sample_frames(path, start, duration, sw, sh, control=NOOP):
+    """Decode the clip once, small and slow, straight into memory."""
+    import numpy as np
+    cmd = ["ffmpeg", "-v", "error", "-ss", str(start), "-i", str(path),
+           "-t", str(duration), "-an", "-sn",
+           "-vf", f"fps={FACE_FPS},scale={sw}:{sh}",
+           "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
+    control.attach(proc)
+    size = sw * sh * 3
+    try:
+        while True:
+            buf = proc.stdout.read(size)
+            if not buf or len(buf) < size:
+                break
+            yield np.frombuffer(buf, np.uint8).reshape(sh, sw, 3)
+    finally:
+        proc.stdout.close()
+        proc.wait()
+
+
+def _mouth_patch(cv2, gray, f):
+    """A fixed-size crop of the mouth, so two samples can be compared."""
+    mx, my = (f[10] + f[12]) / 2, (f[11] + f[13]) / 2
+    bw = max(8.0, abs(f[12] - f[10]) * 2.2, f[2] * 0.45)
+    bh = max(6.0, bw * 0.6)
+    x0, x1 = int(max(0, mx - bw / 2)), int(min(gray.shape[1], mx + bw / 2))
+    y0, y1 = int(max(0, my - bh / 2)), int(min(gray.shape[0], my + bh / 2))
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+    return cv2.resize(gray[y0:y1, x0:x1], (24, 16)).astype("float32")
+
+
+def _collect_faces(cv2, path, start, duration, sw, sh, model, control, progress):
+    """One row of detected faces per sample, with each mouth cut out."""
+    det = cv2.FaceDetectorYN.create(str(model), "", (sw, sh), FACE_SCORE, 0.3, 5000)
+    expected = max(1, int(duration * FACE_FPS))
+    rows = []
+    for i, img in enumerate(_sample_frames(path, start, duration, sw, sh, control)):
+        control.check()
+        _, faces = det.detect(img)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        row = []
+        for f in (faces if faces is not None else []):
+            w, h = float(f[2]), float(f[3])
+            if w < sw * 0.04:                   # a face in the crowd, not a subject
+                continue
+            row.append({"cx": float(f[0]) + w / 2, "cy": float(f[1]) + h / 2,
+                        "w": w, "h": h, "patch": _mouth_patch(cv2, gray, f),
+                        "act": 0.0, "smooth": 0.0})
+        rows.append(row)
+        if progress and i % 5 == 0:
+            progress(min(99.0, i / expected * 100))
+    return rows
+
+
+def _link_tracks(np, rows):
+    """Follow each face from sample to sample and score its mouth movement."""
+    tracks, seen = [], []
+    for i, row in enumerate(rows):
+        here, taken = {}, set()
+        for d in sorted(row, key=lambda d: -d["w"]):
+            best, best_gap = None, None
+            for ti, tr in enumerate(tracks):
+                if ti in taken or i - tr["last"] > FACE_FPS:
+                    continue
+                gap = abs(d["cx"] - tr["cx"]) + abs(d["cy"] - tr["cy"]) * 0.5
+                if gap < max(d["w"], tr["w"]) * 0.8 and (best_gap is None
+                                                         or gap < best_gap):
+                    best, best_gap = ti, gap
+            if best is None:
+                tracks.append({"last": i, "cx": d["cx"], "cy": d["cy"],
+                               "w": d["w"], "patch": None})
+                best = len(tracks) - 1
+            tr = tracks[best]
+            if (tr["patch"] is not None and d["patch"] is not None
+                    and i - tr["last"] <= 2):
+                d["act"] = float(np.abs(d["patch"] - tr["patch"]).mean())
+            tr.update(last=i, cx=d["cx"], cy=d["cy"], w=d["w"], patch=d["patch"])
+            taken.add(best)
+            here[best] = d
+        seen.append(here)
+
+    # Mouth movement over a single pair of samples is noise; over most of a
+    # second it is speech.
+    span = 5
+    for i, here in enumerate(seen):
+        for ti, d in here.items():
+            vals = [seen[j][ti]["act"] for j in range(max(0, i - span + 1), i + 1)
+                    if ti in seen[j]]
+            d["smooth"] = sum(vals) / len(vals) if vals else 0.0
+    return seen
+
+
+def _pick_speaker(seen):
+    """Which face holds the frame at each sample."""
+    chosen, current, since, lead = [], None, -999, 0
+    for i, here in enumerate(seen):
+        if not here:
+            chosen.append(None)
+            continue
+        if current not in here:
+            current, since, lead = max(here, key=lambda t: here[t]["w"]), i, 0
+        elif len(here) > 1:
+            rival = max((t for t in here if t != current),
+                        key=lambda t: here[t]["smooth"])
+            quiet = here[current]["smooth"]
+            lead = lead + 1 if here[rival]["smooth"] > quiet * SPEAKER_LEAD else 0
+            if lead >= SPEAKER_SUSTAIN and (i - since) / FACE_FPS >= SPEAKER_HOLD:
+                current, since, lead = rival, i, 0
+        chosen.append(current)
+    return chosen
+
+
+def _smooth(targets, snaps, limit, reach):
+    """Chase the target with a deadzone and a speed limit; snap on a cut."""
+    cur, out = targets[0], []
+    for i, want in enumerate(targets):
+        if i in snaps or abs(want - cur) > TRACK_CUT * reach:
+            cur = want
+            snaps.add(i)
+        elif abs(want - cur) > TRACK_DEADZONE * reach:
+            step = (want - cur) * TRACK_CHASE
+            cap = TRACK_MAX_STEP * reach
+            cur += max(-cap, min(cap, step))
+        out.append(min(max(cur, 0.0), limit))
+    return out
+
+
+def _keyframes(values, snaps, min_step):
+    """Thin the per-sample track down to the points the crop actually turns."""
+    keys = [(0.0, values[0])]
+    last = len(values) - 1
+    for i in range(1, len(values)):
+        t, v = i / FACE_FPS, values[i]
+        if i in snaps:
+            keys.append((max(0.0, t - 0.5 / FACE_FPS), keys[-1][1]))
+            keys.append((t, v))                 # two keys close together: a cut
+        elif abs(v - keys[-1][1]) >= min_step:
+            keys.append((t, v))
+    if keys[-1][0] < last / FACE_FPS:
+        keys.append((last / FACE_FPS, values[last]))
+    return keys
+
+
+_CROP_EVAL = None
+
+
+def _crop_eval():
+    """ffmpeg 8 evaluates a crop expression every frame and dropped the option
+    that used to ask for it; older builds evaluate once unless asked. Passing
+    an option a build does not have is fatal, so find out which one this is."""
+    global _CROP_EVAL
+    if _CROP_EVAL is None:
+        proc = _run(["ffmpeg", "-hide_banner", "-h", "filter=crop"])
+        _CROP_EVAL = (":eval=frame" if re.search(r"^\s+eval\s", proc.stdout or "",
+                                                 re.M) else "")
+    return _CROP_EVAL
+
+
+def _ramp_expr(keys):
+    """A time expression ffmpeg can evaluate per frame, ramping between keys."""
+    if len(keys) < 2:
+        return f"{keys[0][1]:.1f}"
+    expr = f"{keys[-1][1]:.1f}"
+    for (t0, v0), (t1, v1) in reversed(list(zip(keys, keys[1:]))):
+        if abs(v1 - v0) < 0.5 or t1 - t0 < 1e-4:
+            seg = f"{v0:.1f}"
+        else:
+            seg = f"({v0:.1f}+({v1 - v0:.1f})*(t-{t0:.3f})/{t1 - t0:.4f})"
+        expr = f"if(lt(t,{t1:.3f}),{seg},{expr})"
+    return expr
+
+
+def _plan(values, snaps, reach):
+    """Keyframes for one axis, thinned until the expression is a sane size."""
+    step = TRACK_KEY_STEP * reach
+    keys = _keyframes(values, snaps, step)
+    while len(keys) > TRACK_MAX_KEYS and step < reach:
+        step *= 1.8
+        keys = _keyframes(values, snaps, step)
+    return keys
+
+
+def face_track(video_path, start, end, control=NOOP, progress=None):
+    """Plan a 9:16 crop window that follows whoever is talking.
+
+    Returns the crop size and a per-frame x and y expression, or None when
+    there is nothing worth following, which is the caller's cue to fall back
+    to the blurred fill.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+
+    model = _face_model()
+    if not model:
+        return None
+
+    iw, ih = video_size(video_path)
+    if not iw or not ih:
+        return None
+    cw, ch = _crop_box(iw, ih)
+    if cw >= iw and ch >= ih:
+        return None                 # already 9:16, nothing to reframe
+
+    sw = min(FACE_WIDTH, iw - iw % 2)
+    sh = max(2, int(round(ih * sw / iw / 2)) * 2)
+    rows = _collect_faces(cv2, video_path, start, end - start, sw, sh,
+                          model, control, progress)
+    if len(rows) < 3:
+        return None
+
+    seen = _link_tracks(np, rows)
+    chosen = _pick_speaker(seen)
+    found = [i for i, t in enumerate(chosen) if t is not None]
+    if len(found) / len(chosen) < FACE_COVERAGE:
+        return None
+
+    # Hold the last known position through the frames with no face in them.
+    scale = iw / sw
+    xs, ys, last = [], [], None
+    for i, t in enumerate(chosen):
+        if t is not None:
+            d = seen[i][t]
+            last = (d["cx"] * scale, d["cy"] * scale)
+        elif last is None:
+            d = seen[found[0]][chosen[found[0]]]
+            last = (d["cx"] * scale, d["cy"] * scale)
+        xs.append(last[0])
+        ys.append(last[1])
+
+    snaps = {i for i in range(1, len(chosen))
+             if chosen[i] is not None and chosen[i - 1] is not None
+             and chosen[i] != chosen[i - 1]}
+
+    # A face sitting dead centre looks like a passport photo, so leave more
+    # room under the chin than over the head.
+    left = _smooth([x - cw / 2 for x in xs], snaps, iw - cw, iw)
+    top = _smooth([y - ch * 0.42 for y in ys], snaps, ih - ch, ih)
+
+    return {
+        "crop": (cw, ch),
+        "x": _ramp_expr(_plan(left, snaps, iw)),
+        "y": _ramp_expr(_plan(top, snaps, ih)),
+        "coverage": len(found) / len(chosen),
+        "faces": len({t for t in chosen if t is not None}),
+        "cuts": len(snaps),
+    }
+
+
 def cut(video_path, start, end, out_path, vertical, blur_pad=True,
-        progress=None, control=NOOP, subs=None):
+        progress=None, control=NOOP, subs=None, speaker_track=True):
     duration = end - start
+
+    track = None
+    if vertical and speaker_track:
+        try:
+            track = face_track(
+                video_path, start, end, control,
+                (lambda p: progress(p * TRACK_SHARE / 100)) if progress else None)
+        except Cancelled:
+            raise
+        except Exception:               # noqa: BLE001 - never lose a clip to this
+            track = None                # anything odd falls back to the fill
+
     cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats",
            "-ss", str(start), "-i", str(video_path), "-t", str(duration)]
 
     caption = _ass_filter(subs) if subs else ""
-    if vertical:
+    if vertical and track:
+        cw, ch = track["crop"]
+        vf = (f"crop=w={cw}:h={ch}:x='{track['x']}':y='{track['y']}'"
+              # The crop is a slice of the source, so this is always an
+              # upscale. Lanczos is the one that keeps an edge looking like
+              # an edge at three or four times the size.
+              f"{_crop_eval()},scale=1080:1920:flags=lanczos,setsar=1")
+        if caption:
+            vf += "," + caption
+        cmd += ["-vf", vf]
+    elif vertical:
         if blur_pad:
             # Blur a thumbnail and scale it up rather than blurring at full
             # size. Same look, and it does not pin a weak CPU for minutes.
@@ -874,13 +1491,16 @@ def cut(video_path, start, end, out_path, vertical, blur_pad=True,
             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart", str(out_path)]
 
+    # Detection already moved the bar, so the render fills what is left of it.
+    base = TRACK_SHARE if track else 0.0
+
     def on_line(line):
         if progress and line.startswith("out_time_us="):
             try:
                 done = int(line.split("=", 1)[1]) / 1_000_000
             except ValueError:
                 return
-            progress(min(99, done / duration * 100))
+            progress(min(99, base + done / duration * (100 - base)))
 
     code, stderr = _stream(cmd, control, on_line)
     if code != 0:

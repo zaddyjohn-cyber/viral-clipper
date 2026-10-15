@@ -24,6 +24,11 @@ def load_config():
         "max_clips": 6, "cookies": "none", "cookies_file": "",
         "captions": "punch", "vertical": True,
         "blur_pad": True, "outdir": str(DEFAULT_OUTPUT),
+        # Look of the export. speaker_track reframes onto whoever is talking
+        # and falls back to blur_pad when it finds no face, word_captions
+        # times the burn-in to each word, hook_card burns the scorer's
+        # written hook over the opening.
+        "speaker_track": True, "word_captions": True, "hook_card": True,
     }
     if CONFIG_FILE.exists():
         try:

@@ -15,8 +15,40 @@ or anything else yt-dlp supports.
 1. **Download** the source video with yt-dlp
 2. **Transcribe** it with timestamps, via Groq or locally with faster-whisper
 3. **Score** every candidate window with an LLM, rating hook strength, payoff
-   and whether the clip stands alone
-4. **Cut** the winners to 1080x1920 with a blurred background fill
+   and whether the clip stands alone, and write a short hook for each one
+4. **Cut** the winners to 1080x1920, reframed onto whoever is talking, with
+   word-timed captions and the written hook burned over the opening
+
+---
+
+## What an export looks like
+
+**Reframe.** The crop window finds the faces, follows the one whose mouth is
+moving, and cuts to the other speaker when they take over. It chases rather
+than tracks, so the frame does not jitter with every head movement, and it
+holds a speaker for at least a second before it will move. Footage with no
+face in it, or a source already shot vertical, falls back to the blurred
+fill, which is also what you get with **Follow the speaker** turned off.
+
+Detection uses the YuNet model in `models/`. It is a few milliseconds a
+frame on a plain CPU, and it costs roughly a tenth of the export. Without
+opencv installed, every clip takes the blurred fill instead.
+
+**Captions.** Two to four words at a time, each landing on the word as it is
+said, with a small pop and the live word in the style's accent colour. This
+needs word timings from the transcriber, which both Groq and faster-whisper
+provide; a transcript recorded before this existed falls back to spreading
+each line's words evenly, which still reads well. Captions sit clear of the
+bottom fifth of the frame, where the platform puts its own caption, handle
+and button rail.
+
+**Hook card.** Three to six words the scorer writes for the clip, burned
+across the top third for the first second and a half. It is not a quote: it
+is the promise that stops the scroll. It is shown on the clip card in the
+dashboard before you export, and stored on the clip, so a later pass can
+test one hook against another.
+
+Each of the three is a toggle under Settings > Output.
 
 ---
 

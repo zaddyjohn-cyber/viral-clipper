@@ -69,6 +69,9 @@ async function loadSettings() {
   $('#outdir').value = cfg.outdir;
   $('#vertical').checked = !!cfg.vertical;
   $('#blurPad').checked = !!cfg.blur_pad;
+  $('#speakerTrack').checked = !!cfg.speaker_track;
+  $('#wordCaptions').checked = !!cfg.word_captions;
+  $('#hookCard').checked = !!cfg.hook_card;
   paintProviders();
   paintTranscribers();
   paintCaptions();
@@ -159,6 +162,9 @@ $('#settingsForm').addEventListener('submit', async e => {
     outdir: $('#outdir').value.trim(),
     vertical: $('#vertical').checked,
     blur_pad: $('#blurPad').checked,
+    speaker_track: $('#speakerTrack').checked,
+    word_captions: $('#wordCaptions').checked,
+    hook_card: $('#hookCard').checked,
   };
   if (cfg.transcriber === 'groq') body.groq_model = $('#transModel').value;
   else body.whisper_model = $('#transModel').value;
@@ -399,6 +405,7 @@ function paintGrid(clips) {
       </div>
       <div class="clip-body">
         <div class="clip-title">${esc(c.title)}</div>
+        ${c.hook_card ? `<div class="clip-card" title="Burned over the first seconds">${esc(c.hook_card)}</div>` : ''}
         ${c.hook ? `<div class="clip-hook">${esc(c.hook)}</div>` : ''}
         ${c.reason ? `<div class="clip-reason">${esc(c.reason)}</div>` : ''}
         <div class="clip-listen">

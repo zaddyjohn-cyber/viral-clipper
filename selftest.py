@@ -102,6 +102,7 @@ def fake_score(segments, provider, key, clip_len, max_clips, progress, url=""):
             "score": 90 - i * 10,
             "title": f"Test moment {i + 1}",
             "hook": segments[a]["text"],
+            "hook_card": f"Test hook card {i + 1}",
             "text": " ".join(s["text"] for s in segments[a:b + 1]),
             "reason": "Because this is a test.",
             "tags": ["test", "plumbing"],
@@ -112,7 +113,7 @@ def fake_score(segments, provider, key, clip_len, max_clips, progress, url=""):
 
 
 def fake_cut(video, start, end, dest, vertical, blur_pad=True,
-             progress=None, control=None, subs=None):
+             progress=None, control=None, subs=None, **kw):
     if progress:
         progress(10)
         progress(100)
@@ -126,6 +127,7 @@ CFG = {
     "groq_model": "whisper-large-v3-turbo", "clip_len": 30,
     "max_clips": 4, "cookies": "none", "cookies_file": "",
     "captions": "punch", "vertical": True, "blur_pad": True,
+    "speaker_track": True, "word_captions": True, "hook_card": True,
     "outdir": str(OUT),
 }
 
@@ -178,9 +180,12 @@ def main():
         check("two clips", len(job.get("clips", [])) == 2)
         check("clip fields kept",
               all(k in job["clips"][0] for k in
-                  ("n", "score", "title", "hook", "reason", "text", "tags",
-                   "start", "end", "duration", "exporting", "exported",
+                  ("n", "score", "title", "hook", "hook_card", "reason", "text",
+                   "tags", "start", "end", "duration", "exporting", "exported",
                    "percent", "export_error")))
+        check("hook card stored",
+              job["clips"][0].get("hook_card") == "Test hook card 1",
+              job["clips"][0].get("hook_card"))
         check("meta stored", job.get("meta", {}).get("title") == "Self Test Video")
         check("transcript stored", bool(
             db.Session().get(db.Transcript, jid)))
@@ -215,6 +220,34 @@ def main():
               client.get(f"/api/media/{first.asset_key}").status_code == 200)
         check("media route refuses traversal",
               client.get("/api/media/../../settings.py").status_code in (400, 404))
+
+        # build_ass is not faked out, so the subtitle file the export just
+        # burned in is the real one. Read it back rather than trusting it.
+        print("\nburned-in text")
+        words = [{"start": 0.0, "end": 0.4, "word": "This"},
+                 {"start": 0.4, "end": 0.8, "word": "is"},
+                 {"start": 0.8, "end": 1.4, "word": "word"},
+                 {"start": 1.4, "end": 2.0, "word": "timed."}]
+        timed = [{"start": 0.0, "end": 2.0, "text": "This is word timed.",
+                  "words": words}]
+        ass = engine.build_ass(timed, 0, 2, "punch", TMP / "caps.ass",
+                               hook_card="Three to six words")
+        body = ass.read_text(encoding="utf-8")
+        check("one event per word",
+              body.count("Dialogue: 0,") == len(words), body.count("Dialogue"))
+        check("the live word pops", r"\fscx" in body)
+        check("hook card burned in", "THREE TO SIX WORDS" in body)
+        check("captions clear the phone chrome",
+              all(int(line.rsplit(",", 2)[-2]) >= engine.CAPTION_SAFE_V
+                  for line in body.splitlines() if line.startswith("Style: Cap")))
+        check("no captions still gives a hook card",
+              engine.build_ass(timed, 0, 2, "none", TMP / "hook.ass",
+                               hook_card="Only the card") is not None)
+        check("nothing to burn writes nothing",
+              engine.build_ass([], 0, 2, "none", TMP / "empty.ass") is None)
+        check("hook card trimmed to six words",
+              engine._hook_card({"hook_card": "one two three four five six seven"})
+              == "one two three four five six")
 
         print("\nhistory and rejoin")
         jobs = client.get("/api/jobs").json()

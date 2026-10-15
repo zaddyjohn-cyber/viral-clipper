@@ -147,6 +147,9 @@ class Clip(Base):
 
     title: Mapped[str] = mapped_column(Text, default="")
     hook: Mapped[str] = mapped_column(Text, default="")
+    # The written hook burned across the top of the clip, as opposed to
+    # `hook`, which is the opening line the speaker actually said.
+    hook_card: Mapped[str] = mapped_column(Text, default="", server_default="")
     reason: Mapped[str] = mapped_column(Text, default="")
     score: Mapped[int] = mapped_column(Integer, default=0, index=True)
 

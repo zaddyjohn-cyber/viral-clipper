@@ -194,6 +194,7 @@ def run_analyze(job_id, cfg):
             for c in clips:
                 s.add(db.Clip(
                     job_id=job_id, n=c["n"], title=c["title"], hook=c["hook"],
+                    hook_card=c.get("hook_card", ""),
                     reason=c["reason"], score=c["score"], text=c.get("text", ""),
                     tags=c.get("tags") or [], lines=c.get("lines") or [],
                     start_s=c["start"], end_s=c["end"],
@@ -311,12 +312,14 @@ def run_export(job_id, cfg):
                     f"{engine.slugify(clip.title, 24)}.mp4")
             dest = out / name
 
+            card = clip.hook_card if cfg.get("hook_card", True) else ""
             subs = None
-            if cfg["captions"] != "none" and segments:
+            if (cfg["captions"] != "none" and segments) or card:
                 try:
                     subs = engine.build_ass(
                         segments, clip.start_s, clip.end_s, cfg["captions"],
-                        temp / f"caps{clip.n}.ass")
+                        temp / f"caps{clip.n}.ass", hook_card=card,
+                        word_level=cfg.get("word_captions", True))
                 except OSError:
                     subs = None     # a clip without captions beats no clip
 
@@ -335,7 +338,8 @@ def run_export(job_id, cfg):
             try:
                 engine.cut(video, clip.start_s, clip.end_s, dest,
                            cfg["vertical"], cfg["blur_pad"],
-                           progress=on_percent, control=control, subs=subs)
+                           progress=on_percent, control=control, subs=subs,
+                           speaker_track=cfg.get("speaker_track", True))
             except engine.Cancelled:
                 with db.session() as s:
                     s.execute(db.Clip.__table__.update()
@@ -401,6 +405,7 @@ def _write_report(out, url, meta, picked, job_id):
                 f"{engine.fmt_time(c.end_s)}",
                 f"  Length    : {c.duration}s",
                 f"  Hook      : {c.hook}",
+                f"  Hook card : {c.hook_card}",
                 f"  Why       : {c.reason}",
             ]
             if c.asset_url:
