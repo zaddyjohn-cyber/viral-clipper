@@ -1,5 +1,5 @@
 """
-Viral Clipper API.
+Zaram Viral Klipa API.
 
 Run:  python server.py
 Then open http://127.0.0.1:8420
@@ -48,7 +48,7 @@ async def lifespan(_app):
             stop.set()
 
 
-app = FastAPI(title="Viral Clipper", lifespan=lifespan)
+app = FastAPI(title="Zaram Viral Klipa", lifespan=lifespan)
 
 
 # ---------- shaping rows for the dashboard ----------
@@ -436,7 +436,7 @@ if __name__ == "__main__":
     import uvicorn
     local = f"http://127.0.0.1:{settings.PORT}"
     info = settings.summary()
-    print(f"\n  Viral Clipper running at {local}")
+    print(f"\n  Zaram Viral Klipa running at {local}")
     print(f"  database {info['database_kind']}, storage {info['storage']}, "
           f"redis {'on' if info['redis'] else 'off'}")
     if settings.INLINE_WORKER:

@@ -1,4 +1,4 @@
-# Viral Clipper
+# Zaram Viral Klipa
 
 Paste a video link. Get scored, ready to post shorts.
 
@@ -68,12 +68,39 @@ apt install ffmpeg             # Debian / Ubuntu
 
 ## Run
 
+As a desktop app, in its own window:
+
+```bash
+python desktop.py
+```
+
+Or in your browser, which is the same app and the same database:
+
 ```bash
 python server.py
 ```
 
-Opens at `http://127.0.0.1:8420`. On first run, open **Settings** and add a key
-for whichever engines you want to use.
+Either way it opens at `http://127.0.0.1:8420`. On Windows, `start.bat` runs
+the browser version with a double-click. On first run, open **Settings** and
+add a key for whichever engines you want to use.
+
+### Building the app
+
+```bash
+python build.py
+```
+
+Produces `dist/Zaram Viral Klipa.exe`: one file, no Python installed, no
+terminal window. Copy it anywhere and double-click it. Being one file costs
+a few seconds on every launch, because Windows unpacks the app to a temp
+folder before it runs, which is the trade for it standing on its own.
+
+`python make_icon.py` redraws the icon the build uses.
+
+Two things stay outside the build: ffmpeg
+and yt-dlp are separate programs and still have to be on PATH, and the local
+faster-whisper engine is left out because it drags in over a gigabyte of
+torch for something only needed offline. The built app transcribes with Groq.
 
 ---
 

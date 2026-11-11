@@ -156,7 +156,7 @@ def wait_for(client, jid, predicate, timeout=30, label=""):
 
 
 def main():
-    print(f"\nViral Clipper self test\n  scratch: {TMP}\n")
+    print(f"\nZaram Viral Klipa self test\n  scratch: {TMP}\n")
 
     with TestClient(server.app) as client:
         print("health")

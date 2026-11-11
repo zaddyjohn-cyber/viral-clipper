@@ -299,15 +299,23 @@ def run_export(job_id, cfg):
         stop.set()
         return
 
-    # Each clip's end card names the clip meant to follow it, so the chain
-    # is worked out across this whole export rather than per clip. Only what
-    # is being cut now goes in it: a clip must not promise a file that was
-    # never written.
+    # Each clip's end card names the clip meant to follow it, so the chain is
+    # worked out across the run rather than per clip. It covers everything
+    # that will exist as a file once this export finishes, which is what is
+    # being cut now plus whatever was cut before: a clip must not promise a
+    # file that was never written, but exporting them one at a time should
+    # still build the same chain as exporting them together.
     chain = {}
     if cfg.get("cta", True):
+        with db.session() as s:
+            every = list(s.scalars(
+                select(db.Clip).where(db.Clip.job_id == job_id)
+                .order_by(db.Clip.n)))
+        wanted = {c.n for c in picked}
         chain = engine.cta_chain(
             [{"n": c.n, "score": c.score, "start": c.start_s,
-              "hook_card": c.hook_card, "title": c.title} for c in picked],
+              "hook_card": c.hook_card, "title": c.title} for c in every
+             if c.n in wanted or c.status == db.CLIP_EXPORTED],
             lead=cfg.get("cta_text") or engine.CTA_LEAD)
 
     done = 0
