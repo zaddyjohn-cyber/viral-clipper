@@ -299,6 +299,17 @@ def run_export(job_id, cfg):
         stop.set()
         return
 
+    # Each clip's end card names the clip meant to follow it, so the chain
+    # is worked out across this whole export rather than per clip. Only what
+    # is being cut now goes in it: a clip must not promise a file that was
+    # never written.
+    chain = {}
+    if cfg.get("cta", True):
+        chain = engine.cta_chain(
+            [{"n": c.n, "score": c.score, "start": c.start_s,
+              "hook_card": c.hook_card, "title": c.title} for c in picked],
+            lead=cfg.get("cta_text") or engine.CTA_LEAD)
+
     done = 0
     try:
         for i, clip in enumerate(picked, 1):
@@ -312,14 +323,32 @@ def run_export(job_id, cfg):
                     f"{engine.slugify(clip.title, 24)}.mp4")
             dest = out / name
 
+            # Where the face is decides which side the end card takes, so
+            # the track is worked out here and handed to the cut as well,
+            # rather than being paid for twice.
+            track = None
+            if cfg["vertical"] and cfg.get("speaker_track", True):
+                try:
+                    track = engine.face_track(video, clip.start_s, clip.end_s,
+                                              control)
+                except engine.Cancelled:
+                    raise
+                except Exception:       # noqa: BLE001 - falls back to the fill
+                    track = None
+
             card = clip.hook_card if cfg.get("hook_card", True) else ""
+            cta = chain.get(clip.n)
             subs = None
-            if (cfg["captions"] != "none" and segments) or card:
+            if (cfg["captions"] != "none" and segments) or card or cta:
                 try:
                     subs = engine.build_ass(
                         segments, clip.start_s, clip.end_s, cfg["captions"],
-                        temp / f"caps{clip.n}.ass", hook_card=card,
-                        word_level=cfg.get("word_captions", True))
+                        temp / f"caps{clip.n}.ass", hook_card=card, cta=cta,
+                        word_level=cfg.get("word_captions", True),
+                        cta_at=engine.cta_side(
+                            track,
+                            max(0.0, clip.end_s - clip.start_s - engine.CTA_SECONDS),
+                            clip.end_s - clip.start_s))
                 except OSError:
                     subs = None     # a clip without captions beats no clip
 
@@ -339,7 +368,8 @@ def run_export(job_id, cfg):
                 engine.cut(video, clip.start_s, clip.end_s, dest,
                            cfg["vertical"], cfg["blur_pad"],
                            progress=on_percent, control=control, subs=subs,
-                           speaker_track=cfg.get("speaker_track", True))
+                           speaker_track=cfg.get("speaker_track", True),
+                           track=track)
             except engine.Cancelled:
                 with db.session() as s:
                     s.execute(db.Clip.__table__.update()
@@ -397,9 +427,24 @@ def _write_report(out, url, meta, picked, job_id):
             f"Platform : {meta.get('uploader', '')}",
             "", "-" * 60, "",
         ]
+
+        # The order matters more than the files do: the first clip is the one
+        # that has to earn the follow, and every clip after it is being
+        # watched by someone who followed for exactly that.
+        order = engine.post_order([{"n": c.n, "score": c.score,
+                                    "start": c.start_s, "title": c.title}
+                                   for c in rows])
+        if len(order) > 1:
+            lines.append("Post them in this order:")
+            lines += [f"  {c['post_order']}. {c['title']} ({c['score']}%)"
+                      for c in order]
+            lines += ["", "-" * 60, ""]
+        rank = {c["n"]: c["post_order"] for c in order}
+
         for c in rows:
             lines += [
                 c.file_path or c.title,
+                f"  Post      : {rank.get(c.n, 1)} of {len(rows)}",
                 f"  Score     : {c.score}%",
                 f"  Timestamp : {engine.fmt_time(c.start_s)} - "
                 f"{engine.fmt_time(c.end_s)}",

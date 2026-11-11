@@ -698,6 +698,12 @@ def _trim_card(text):
     text = re.sub(r"\s+", " ", (text or "").strip(" \"'`*#.,!?-"))
     if not text:
         return ""
+    # A line ending on a word that cannot end a sentence was cut off, whoever
+    # cut it. Burning it in looks like a bug to everyone who sees it.
+    if re.search(r"\b(the|a|an|and|or|but|to|of|for|from|with|on|in|at|by|as"
+                 r"|is|was|that|this|his|her|their|my|your|our|its)$",
+                 text, re.I):
+        return ""
     words = text.split()
     if len(words) > HOOK_CARD_WORDS or len(text) > HOOK_CARD_CHARS:
         # Unless it breaks cleanly at punctuation the model put there itself.
@@ -892,6 +898,26 @@ CAPTION_SETTLE = 130       # ms it takes to settle back to 100
 CAPTION_SAFE_V = 420
 CAPTION_SAFE_H = 130
 
+# The call to action at the end. A clip that names what comes next earns a
+# follow in a way "follow for more" never does, so each one teases the clip
+# that is meant to be posted after it.
+CTA_SECONDS = 3.0
+CTA_LEAD = "Follow and subscribe for"
+CTA_LAST = "more like this"      # when there is no next clip to point at
+CTA_STYLE = {
+    # A column down one side rather than a banner across the middle, so it
+    # never lands on the face of the person it is asking you to follow.
+    "font": "Arial Black", "size": 46, "primary": "&H00FFFFFF",
+    # The app's accent, as BGR: a filled box reads as something to do,
+    # where the hook card's dark box reads as something to know.
+    "outline": "&H00FC5C7C", "back": "&H00FC5C7C", "border": 3,
+    "outline_w": 12, "shadow": 0, "margin_v": 300,
+}
+CTA_LEAD_SIZE = 32
+CTA_COL_W = 430           # how wide the column is allowed to run
+CTA_EDGE = 60             # and how far it sits off the side of the frame
+CTA_CLEAR = 40            # space it keeps between itself and a face
+
 # The written hook, burned across the top third for the first moment or two.
 HOOK_SECONDS = 1.5
 HOOK_STYLE = {
@@ -1051,13 +1077,75 @@ def _style_line(name, st, align, margin_v, margin_h):
             f"{margin_h},{margin_h},{margin_v},1")
 
 
+def post_order(clips):
+    """The order to post a run's clips in, strongest first.
+
+    The first one has to earn the follow, so it is the one the scorer rated
+    highest, and every clip after that is already being watched by someone
+    who followed for it.
+    """
+    ranked = sorted(clips, key=lambda c: (-int(c.get("score") or 0),
+                                          float(c.get("start") or 0)))
+    return [dict(c, post_order=i + 1) for i, c in enumerate(ranked)]
+
+
+def cta_chain(clips, lead=CTA_LEAD, last=CTA_LAST):
+    """What each clip should promise, which is the next clip by name.
+
+    Returns {clip number: (lead line, tease)}. The tease is the next clip's
+    written hook, so the promise and the payoff are the same words.
+    """
+    ranked = post_order(clips)
+    out = {}
+    for i, c in enumerate(ranked):
+        tease = last
+        if i + 1 < len(ranked):
+            nxt = ranked[i + 1]
+            # Same rule as the hook card: a promise that reads as a cut-off
+            # sentence is worse than a shorter one that reads whole.
+            tease = (_trim_card(nxt.get("hook_card"))
+                     or _trim_card(nxt.get("title")) or last)
+        out[c["n"]] = (lead, _ass_text(tease))
+    return out
+
+
+def cta_side(track, at, until):
+    """Which side of the frame the end card can have without covering a face.
+
+    Measured over the seconds the card is actually up, in the coordinates of
+    the exported frame. With no face to work around, or a face wide enough to
+    leave no room either side, it goes right, which is the side the platforms
+    keep their own buttons off.
+    """
+    faces = (track or {}).get("face_at") or []
+    window = [f for f in faces if at - 0.5 <= f[0] <= until + 0.5] or faces
+    if not window:
+        return "right"
+
+    # Count the frames each side would actually land on a face. One stray
+    # sample should not decide this, and the side that clashes least is the
+    # answer whether or not either side is perfectly clear.
+    def clashes(x0, x1):
+        return sum(1 for _, cx, half in window
+                   if cx - half - CTA_CLEAR < x1 and cx + half + CTA_CLEAR > x0)
+
+    on_left = clashes(CTA_EDGE, CTA_EDGE + CTA_COL_W)
+    on_right = clashes(OUT_W - CTA_EDGE - CTA_COL_W, OUT_W - CTA_EDGE)
+    return "left" if on_left < on_right else "right"
+
+
 def build_ass(segments, start, end, style_name, out_path, width=1080, height=1920,
-              hook_card="", word_level=True):
-    """Write the subtitle file burned over a clip: captions, hook card, or both."""
+              hook_card="", word_level=True, cta=None, cta_at="right"):
+    """Write the subtitle file burned over a clip.
+
+    cta is the (lead line, tease) pair for the end card, as cta_chain builds it.
+    """
     st = CAPTION_STYLES.get(style_name)
     captions = bool(st) and style_name != "none"
     hook = _ass_text(hook_card)[:HOOK_CARD_CHARS]
-    if not captions and not hook:
+    lead, tease = (cta or ("", ""))
+    lead, tease = _ass_text(lead), _ass_text(tease)
+    if not captions and not hook and not tease:
         return None
 
     styles, body = [], []
@@ -1084,6 +1172,32 @@ def build_ass(segments, start, end, style_name, out_path, width=1080, height=192
             f"Dialogue: 1,{_ass_time(0)},{_ass_time(HOOK_SECONDS)},Hook,,0,0,0,,"
             + "{" + r"\fad(140,260)\fscx84\fscy84\t(0,200,\fscx100\fscy100)" + "}"
             + hook.upper())
+
+    if tease:
+        # Pinned to one side, top aligned, in a column narrow enough that it
+        # cannot reach the middle of the frame where the face is. Alignment
+        # 7 is top left, 9 top right; the wide margin on the other side is
+        # what holds the column to its width.
+        rest = width - CTA_COL_W - CTA_EDGE
+        left_m, right_m = ((CTA_EDGE, rest) if cta_at == "left"
+                           else (rest, CTA_EDGE))
+        styles.append(
+            f"Style: Cta,{CTA_STYLE['font']},{CTA_STYLE['size']},"
+            f"{CTA_STYLE['primary']},&H000000FF,{CTA_STYLE['outline']},"
+            f"{CTA_STYLE['back']},-1,0,0,0,100,100,0,0,{CTA_STYLE['border']},"
+            f"{CTA_STYLE['outline_w']},{CTA_STYLE['shadow']},"
+            f"{7 if cta_at == 'left' else 9},{left_m},{right_m},"
+            f"{CTA_STYLE['margin_v']},1")
+        # Late enough to have earned the ask, early enough that it is still
+        # on screen when the thumb starts moving.
+        at = max(0.0, (end - start) - CTA_SECONDS)
+        body.append(
+            f"Dialogue: 1,{_ass_time(at)},{_ass_time(end - start)},Cta,,0,0,0,,"
+            + "{" + r"\fad(180,120)\fscx86\fscy86\t(0,220,\fscx100\fscy100)"
+            + rf"\fs{CTA_LEAD_SIZE}" + "}"
+            + (lead or CTA_LEAD).upper()
+            + r"\N{" + rf"\fs{CTA_STYLE['size']}" + "}"
+            + tease.upper())
 
     if not body:
         return None
@@ -1130,6 +1244,8 @@ FACE_MODEL_URL = ("https://github.com/opencv/opencv_zoo/raw/main/models/"
                   "face_detection_yunet/" + FACE_MODEL_NAME)
 FACE_MODEL_DIRS = [Path(__file__).resolve().parent / "models",
                    Path.home() / ".viral_clipper" / "models"]
+
+OUT_W, OUT_H = 1080, 1920   # the exported frame everything is measured against
 
 FACE_FPS = 6              # detection rate, nothing to do with the output
 FACE_WIDTH = 480          # detection runs on a small copy of the picture
@@ -1421,16 +1537,17 @@ def face_track(video_path, start, end, control=NOOP, progress=None):
 
     # Hold the last known position through the frames with no face in them.
     scale = iw / sw
-    xs, ys, last = [], [], None
+    xs, ys, ws, last = [], [], [], None
     for i, t in enumerate(chosen):
         if t is not None:
             d = seen[i][t]
-            last = (d["cx"] * scale, d["cy"] * scale)
+            last = (d["cx"] * scale, d["cy"] * scale, d["w"] * scale)
         elif last is None:
             d = seen[found[0]][chosen[found[0]]]
-            last = (d["cx"] * scale, d["cy"] * scale)
+            last = (d["cx"] * scale, d["cy"] * scale, d["w"] * scale)
         xs.append(last[0])
         ys.append(last[1])
+        ws.append(last[2])
 
     snaps = {i for i in range(1, len(chosen))
              if chosen[i] is not None and chosen[i - 1] is not None
@@ -1441,6 +1558,14 @@ def face_track(video_path, start, end, control=NOOP, progress=None):
     left = _smooth([x - cw / 2 for x in xs], snaps, iw - cw, iw)
     top = _smooth([y - ch * 0.42 for y in ys], snaps, ih - ch, ih)
 
+    # Where the face lands in the exported frame, which is what anything
+    # burned on top has to stay out of the way of.
+    out_scale = OUT_W / cw
+    faces = [(i / FACE_FPS,
+              (xs[i] - left[i]) * out_scale,
+              ws[i] / 2 * out_scale)
+             for i in range(len(xs))]
+
     return {
         "crop": (cw, ch),
         "x": _ramp_expr(_plan(left, snaps, iw)),
@@ -1448,15 +1573,20 @@ def face_track(video_path, start, end, control=NOOP, progress=None):
         "coverage": len(found) / len(chosen),
         "faces": len({t for t in chosen if t is not None}),
         "cuts": len(snaps),
+        "face_at": faces,
     }
 
 
 def cut(video_path, start, end, out_path, vertical, blur_pad=True,
-        progress=None, control=NOOP, subs=None, speaker_track=True):
+        progress=None, control=NOOP, subs=None, speaker_track=True, track=None):
+    """Cut one clip. track is a face_track result, when the caller already
+    has one: it is also what decides where the end card goes, so the caller
+    works it out first and hands it over rather than paying for it twice."""
     duration = end - start
 
-    track = None
-    if vertical and speaker_track:
+    detected = False
+    if vertical and speaker_track and track is None:
+        detected = True
         try:
             track = face_track(
                 video_path, start, end, control,
@@ -1506,7 +1636,7 @@ def cut(video_path, start, end, out_path, vertical, blur_pad=True,
             "-movflags", "+faststart", str(out_path)]
 
     # Detection already moved the bar, so the render fills what is left of it.
-    base = TRACK_SHARE if track else 0.0
+    base = TRACK_SHARE if (track and detected) else 0.0
 
     def on_line(line):
         if progress and line.startswith("out_time_us="):

@@ -252,6 +252,33 @@ def main():
               engine._hook_card({
                   "hook_card": "this one goes on and on and on well past the frame",
                   "title": "The impossible shot"}) == "The impossible shot")
+        series = [{"n": 1, "score": 60, "start": 0, "title": "The quiet one",
+                   "hook_card": "He never said a word"},
+                  {"n": 2, "score": 90, "start": 30, "title": "The big one",
+                   "hook_card": "She bet the whole house"}]
+        check("the best clip is posted first",
+              [c["n"] for c in engine.post_order(series)] == [2, 1])
+        chain = engine.cta_chain(series)
+        check("each clip teases the next one by name",
+              chain[2][1] == "He never said a word", chain[2][1])
+        check("the last clip asks on its own",
+              chain[1][1] == engine.CTA_LAST, chain[1][1])
+        end = engine.build_ass(timed, 0, 2, "punch", TMP / "cta.ass",
+                               cta=("Follow and subscribe for", "The next one"))
+        check("the end card is burned in",
+              "FOLLOW AND SUBSCRIBE FOR" in end.read_text(encoding="utf-8"))
+        hugging_right = {"face_at": [(i / 6, 880, 160) for i in range(18)]}
+        hugging_left = {"face_at": [(i / 6, 200, 160) for i in range(18)]}
+        check("the end card takes the side the face is not on",
+              engine.cta_side(hugging_right, 0, 3) == "left"
+              and engine.cta_side(hugging_left, 0, 3) == "right")
+        check("with no face to dodge it has a default side",
+              engine.cta_side(None, 0, 3) in ("left", "right"))
+        side = engine.build_ass(timed, 0, 2, "none", TMP / "side.ass",
+                                cta=("Follow for", "The next one"), cta_at="left")
+        check("the end card is pinned to that side",
+              ",7," in [l for l in side.read_text(encoding="utf-8").splitlines()
+                        if l.startswith("Style: Cta")][0])
         check("a hook card breaks at its own punctuation",
               engine._hook_card({"hook_card": "One inch beam, and the whole prize "
                                               "on the line"}) == "One inch beam")

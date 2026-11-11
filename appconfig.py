@@ -29,6 +29,9 @@ def load_config():
         # times the burn-in to each word, hook_card burns the scorer's
         # written hook over the opening.
         "speaker_track": True, "word_captions": True, "hook_card": True,
+        # The end card. cta_text is the line above the tease, which is the
+        # next clip's own hook, so the ask names what it is asking for.
+        "cta": True, "cta_text": engine.CTA_LEAD,
     }
     if CONFIG_FILE.exists():
         try:

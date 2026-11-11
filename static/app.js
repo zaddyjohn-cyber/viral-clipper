@@ -72,6 +72,8 @@ async function loadSettings() {
   $('#speakerTrack').checked = !!cfg.speaker_track;
   $('#wordCaptions').checked = !!cfg.word_captions;
   $('#hookCard').checked = !!cfg.hook_card;
+  $('#cta').checked = !!cfg.cta;
+  $('#ctaText').value = cfg.cta_text || '';
   paintProviders();
   paintTranscribers();
   paintCaptions();
@@ -165,6 +167,8 @@ $('#settingsForm').addEventListener('submit', async e => {
     speaker_track: $('#speakerTrack').checked,
     word_captions: $('#wordCaptions').checked,
     hook_card: $('#hookCard').checked,
+    cta: $('#cta').checked,
+    cta_text: $('#ctaText').value.trim(),
   };
   if (cfg.transcriber === 'groq') body.groq_model = $('#transModel').value;
   else body.whisper_model = $('#transModel').value;
@@ -383,11 +387,41 @@ function paintGrid(clips) {
   updateSel();
 }
 
+const ORDINAL = ['', '1st', '2nd', '3rd', '4th', '5th', '6th', '7th', '8th',
+                 '9th', '10th'];
+
+/* The order to post in, and what each clip's end card will promise: the
+   next one along. Worked out here so it is on screen before the export,
+   the same way the worker works it out when it burns the cards. */
+// Matches the guard the engine applies before burning a card in: a line
+// ending on a word that cannot end a sentence was cut off somewhere, so the
+// title stands in for it. Kept in step so what is shown is what gets burned.
+const DANGLING = /\b(the|a|an|and|or|but|to|of|for|from|with|on|in|at|by|as|is|was|that|this|his|her|their|my|your|our|its)$/i;
+
+function teaseFor(clip) {
+  const hook = (clip.hook_card || '').trim();
+  return (hook && !DANGLING.test(hook)) ? hook : clip.title;
+}
+
+function postPlan(clips) {
+  const ranked = [...clips].sort((a, b) => b.score - a.score || a.start - b.start);
+  const plan = {};
+  ranked.forEach((c, i) => {
+    const next = ranked[i + 1];
+    plan[c.n] = {
+      order: i + 1,
+      tease: next ? teaseFor(next) : 'more like this',
+    };
+  });
+  return plan;
+}
+
 function drawGrid(clips) {
   const C = 2 * Math.PI * 21;
   // Analysis only pulls the audio, so until the video is here a moment can
   // be heard but not seen. The first export fetches it, once, for all clips.
   const local = !!(state.job && state.job.has_video);
+  const plan = postPlan(clips);
   $('#clipGrid').innerHTML = clips.map((c, i) => {
     const col = scoreColor(c.score);
     const off = C * (1 - c.score / 100);
@@ -431,10 +465,14 @@ function drawGrid(clips) {
         </div>
         <span class="clip-time">${fmt(c.start)} - ${fmt(c.end)}</span>
         <span class="clip-len">${Math.round(c.duration)}s</span>
+        <span class="clip-order" title="Post them in this order">
+          Post ${ORDINAL[plan[c.n].order] || plan[c.n].order}</span>
       </div>
       <div class="clip-body">
         <div class="clip-title">${esc(c.title)}</div>
         ${c.hook_card ? `<div class="clip-card" title="Burned over the first seconds">${esc(c.hook_card)}</div>` : ''}
+        ${cfg && cfg.cta !== false ? `<div class="clip-cta" title="Burned over the last seconds">
+          <b>${esc(cfg.cta_text || 'Follow and subscribe for')}</b> ${esc(plan[c.n].tease)}</div>` : ''}
         ${c.hook ? `<div class="clip-hook">${esc(c.hook)}</div>` : ''}
         ${c.reason ? `<div class="clip-reason">${esc(c.reason)}</div>` : ''}
         <div class="clip-listen">
