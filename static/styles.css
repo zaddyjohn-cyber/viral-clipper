@@ -293,6 +293,7 @@ code{font-family:ui-monospace,'Cascadia Code',Consolas,monospace;font-size:.88em
   background:#101019e8;flex-wrap:wrap;
 }
 .toolbar-left{display:flex;align-items:center;gap:8px}
+.toolbar-right{display:flex;align-items:center;gap:8px}
 .toolbar-count{font-size:12.5px;color:var(--faint);margin-left:5px}
 
 /* ───── clip grid ───── */
@@ -315,6 +316,10 @@ code{font-family:ui-monospace,'Cascadia Code',Consolas,monospace;font-size:.88em
   content:'';position:absolute;inset:0;pointer-events:none;
   background:linear-gradient(185deg,#00000000 38%,#09090fcc);
 }
+/* The moment plays over its own thumbnail, so it has to clear the gradient
+   and the tint that sit on top of a still card. */
+.clip-media video{position:absolute;inset:0;z-index:2;background:#000;object-fit:contain}
+.clip-media.is-playing::after{opacity:0}
 .clip-pick{
   position:absolute;top:11px;left:11px;z-index:3;width:24px;height:24px;border-radius:7px;
   background:#09090fb0;border:1.5px solid #ffffff38;backdrop-filter:blur(6px);
@@ -515,6 +520,9 @@ code{font-family:ui-monospace,'Cascadia Code',Consolas,monospace;font-size:.88em
 .listen:hover,.readmore:hover{background:#2b2b3d;color:var(--text);border-color:#3f3f55}
 .listen.is-playing{background:var(--accent);border-color:var(--accent);color:#fff}
 .listen.is-playing svg{animation:thump .9s ease-in-out infinite}
+/* The first watch of a clip waits while the server cuts the window out. */
+.listen.is-loading{color:var(--dim);pointer-events:none}
+.listen.is-loading svg{animation:spin .9s linear infinite}
 @keyframes thump{0%,100%{transform:scale(1)}50%{transform:scale(1.22)}}
 .clip-text{
   font-size:12px;line-height:1.62;color:var(--dim);background:var(--surface-2);

@@ -245,9 +245,16 @@ def main():
                                hook_card="Only the card") is not None)
         check("nothing to burn writes nothing",
               engine.build_ass([], 0, 2, "none", TMP / "empty.ass") is None)
-        check("hook card trimmed to six words",
-              engine._hook_card({"hook_card": "one two three four five six seven"})
-              == "one two three four five six")
+        check("a short hook card is kept whole",
+              engine._hook_card({"hook_card": "He has to shoot from way back"})
+              == "He has to shoot from way back")
+        check("a rambling hook card falls back to the title",
+              engine._hook_card({
+                  "hook_card": "this one goes on and on and on well past the frame",
+                  "title": "The impossible shot"}) == "The impossible shot")
+        check("a hook card breaks at its own punctuation",
+              engine._hook_card({"hook_card": "One inch beam, and the whole prize "
+                                              "on the line"}) == "One inch beam")
 
         print("\nhistory and rejoin")
         jobs = client.get("/api/jobs").json()

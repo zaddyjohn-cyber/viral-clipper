@@ -184,10 +184,16 @@
             <button class="btn btn-ghost btn-sm" id="selectNoneBtn">Clear</button>
             <span class="toolbar-count" id="selCount">0 selected</span>
           </div>
-          <button class="btn btn-accent" id="exportBtn" disabled>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v10M7.5 10 12 14.5 16.5 10M5 19h14"/></svg>
-            Export selected
-          </button>
+          <div class="toolbar-right">
+            <button class="btn btn-ghost" id="downloadBtn" hidden>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v10M7.5 10 12 14.5 16.5 10M5 19h14"/></svg>
+              Download selected
+            </button>
+            <button class="btn btn-accent" id="exportBtn" disabled>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v10M7.5 10 12 14.5 16.5 10M5 19h14"/></svg>
+              Export selected
+            </button>
+          </div>
         </div>
 
         <div class="grid" id="clipGrid"></div>

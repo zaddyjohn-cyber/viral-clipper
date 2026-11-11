@@ -357,8 +357,37 @@ function paintResults(job) {
   show('library');
 }
 
+/* The grid is rebuilt from scratch on every poll, which would throw away a
+   clip someone is in the middle of watching. The player is lifted out
+   first and put back into its card afterwards, still at the same moment. */
+function keepPlaying(paint) {
+  const live = playingN === null ? null : $('.clip-media video');
+  const at = live ? live.currentTime : 0;
+  const running = live ? !live.paused : false;
+  if (live) live.remove();
+
+  paint();
+
+  if (!live) return;
+  const media = $(`.clip[data-n="${playingN}"] .clip-media`);
+  if (!media) { playingN = null; return; }
+  media.appendChild(live);
+  media.classList.add('is-playing');
+  $(`[data-watch="${playingN}"]`)?.classList.add('is-playing');
+  if (Math.abs(live.currentTime - at) > 0.3) live.currentTime = at;
+  if (running) live.play().catch(() => {});
+}
+
 function paintGrid(clips) {
+  keepPlaying(() => drawGrid(clips));
+  updateSel();
+}
+
+function drawGrid(clips) {
   const C = 2 * Math.PI * 21;
+  // Analysis only pulls the audio, so until the video is here a moment can
+  // be heard but not seen. The first export fetches it, once, for all clips.
+  const local = !!(state.job && state.job.has_video);
   $('#clipGrid').innerHTML = clips.map((c, i) => {
     const col = scoreColor(c.score);
     const off = C * (1 - c.score / 100);
@@ -378,7 +407,7 @@ function paintGrid(clips) {
           Saved</div>
         <a class="btn btn-ghost" href="/api/clip/${state.job.id}/${c.n}" download>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v10M7.5 10 12 14.5 16.5 10M5 19h14"/></svg>
-          Save as</a>`;
+          Download</a>`;
     } else {
       foot = `<button class="btn btn-accent" data-export="${c.n}">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v10M7.5 10 12 14.5 16.5 10M5 19h14"/></svg>
@@ -409,9 +438,10 @@ function paintGrid(clips) {
         ${c.hook ? `<div class="clip-hook">${esc(c.hook)}</div>` : ''}
         ${c.reason ? `<div class="clip-reason">${esc(c.reason)}</div>` : ''}
         <div class="clip-listen">
-          <button class="listen" data-listen="${c.n}" title="Hear this moment">
+          <button class="listen" data-watch="${c.n}" title="${local
+            ? 'See this moment' : 'Hear this moment. The picture arrives with your first export'}">
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.5v13l11-6.5z"/></svg>
-            Listen
+            ${local ? 'Watch' : 'Listen'}
           </button>
           ${c.text ? `<button class="readmore" data-read="${c.n}">Read it</button>` : ''}
         </div>
@@ -421,14 +451,25 @@ function paintGrid(clips) {
       <div class="clip-foot">${foot}</div>
     </article>`;
   }).join('');
-
-  updateSel();
 }
 
 function updateSel() {
   const n = state.picked.size;
   $('#selCount').textContent = `${n} selected`;
   $('#exportBtn').disabled = n === 0 || state.exporting;
+
+  // Only cut clips can be downloaded, so the button appears once the
+  // selection holds some, and says how many it will actually fetch.
+  const ready = downloadable();
+  const btn = $('#downloadBtn');
+  btn.hidden = ready.length === 0;
+  btn.lastChild.textContent = ready.length === 1
+    ? ' Download clip' : ` Download ${ready.length} clips`;
+}
+
+function downloadable() {
+  const clips = (state.job && state.job.clips) || [];
+  return clips.filter(c => c.exported && state.picked.has(c.n));
 }
 
 /* ───────── interactions ───────── */
@@ -452,31 +493,70 @@ $('#clipGrid').addEventListener('click', async e => {
     return;
   }
 
-  const play = e.target.closest('[data-listen]');
-  if (play) { listen(+play.dataset.listen, play); return; }
+  const play = e.target.closest('[data-watch]');
+  if (play) { watch(+play.dataset.watch, play); return; }
 });
 
-let player = null;
 let playingN = null;
+let audio = null;
 
-function listen(n, btn) {
-  const stop = () => {
-    if (player) { player.pause(); player = null; }
-    $$('[data-listen]').forEach(b => b.classList.remove('is-playing'));
-    playingN = null;
-  };
+function stopWatching() {
+  if (audio) { audio.pause(); audio = null; }
+  $$('.clip-media video').forEach(v => { v.pause(); v.remove(); });
+  $$('.clip-media').forEach(m => m.classList.remove('is-playing'));
+  $$('[data-watch]').forEach(b => b.classList.remove('is-playing', 'is-loading'));
+  playingN = null;
+}
 
-  if (playingN === n) { stop(); return; }
-  stop();
+/* The moment plays where its thumbnail is, so the card stays put and the
+   score, hook and transcript sit beside what you are looking at.
 
+   This is a seek into the downloaded source rather than a render, so it
+   starts at once. Before the source is here there is only the audio
+   analysis pulled, and that plays instead. */
+function watch(n, btn) {
+  if (playingN === n) { stopWatching(); return; }
+  stopWatching();
+
+  const clip = (state.job.clips || []).find(c => c.n === n);
+  const media = btn.closest('.clip').querySelector('.clip-media');
+  if (!clip || !media) return;
   playingN = n;
-  btn.classList.add('is-playing');
-  player = new Audio(`/api/preview/${state.job.id}/${n}`);
-  player.play().catch(() => {
-    toast('Could not play that', 'The audio for this run may have been cleared.', 'err');
-    stop();
+
+  if (!state.job.has_video) { hear(n, clip, btn); return; }
+
+  const video = document.createElement('video');
+  video.src = `/api/source/${state.job.id}#t=${clip.start.toFixed(2)}`;
+  video.controls = true;
+  video.autoplay = true;
+  video.playsInline = true;
+  video.addEventListener('ended', stopWatching);
+  // The fragment start is a hint some browsers ignore, and none of them
+  // know where the moment ends, so both ends are held here.
+  video.addEventListener('loadedmetadata', () => {
+    if (Math.abs(video.currentTime - clip.start) > 0.5) video.currentTime = clip.start;
   });
-  player.addEventListener('ended', stop);
+  video.addEventListener('timeupdate', () => {
+    if (video.currentTime >= clip.end) { video.pause(); stopWatching(); }
+  });
+  video.addEventListener('error', () => {
+    stopWatching();
+    toast('Could not play that', 'The downloaded video is no longer on disk.', 'err');
+  });
+
+  media.appendChild(video);
+  media.classList.add('is-playing');
+  btn.classList.add('is-playing');
+}
+
+function hear(n, clip, btn) {
+  btn.classList.add('is-playing');
+  audio = new Audio(`/api/preview/${state.job.id}/${n}`);
+  audio.addEventListener('ended', stopWatching);
+  audio.play().catch(() => {
+    toast('Could not play that', 'The audio for this run may have been cleared.', 'err');
+    stopWatching();
+  });
 }
 
 $('#selectAllBtn').addEventListener('click', () => {
@@ -488,6 +568,23 @@ $('#selectNoneBtn').addEventListener('click', () => {
   paintGrid(state.job.clips);
 });
 $('#exportBtn').addEventListener('click', () => exportClips([...state.picked]));
+
+/* Browsers drop a burst of downloads fired in one go, so they are spaced
+   out far enough that each one is treated as its own. */
+$('#downloadBtn').addEventListener('click', () => {
+  const ready = downloadable();
+  if (!ready.length) return;
+  ready.forEach((c, i) => setTimeout(() => {
+    const a = document.createElement('a');
+    a.href = `/api/clip/${state.job.id}/${c.n}`;
+    a.download = '';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }, i * 400));
+  toast(ready.length === 1 ? 'Downloading the clip' : `Downloading ${ready.length} clips`,
+        'Your browser will put them wherever it keeps downloads.');
+});
 
 async function exportClips(nums) {
   if (!state.job || !nums.length) return;

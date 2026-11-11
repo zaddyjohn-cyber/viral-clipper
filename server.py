@@ -79,7 +79,9 @@ def job_json(job, clips):
         "stages": db.STAGES,
         "fetching_video": job.fetching_video,
         "export_error": job.export_error,
-        "has_video": bool(job.video_path),
+        # Checked on disk, not just recorded: a cleared cache leaves the path
+        # behind, and the dashboard uses this to decide it can seek the source.
+        "has_video": bool(job.video_path and Path(job.video_path).exists()),
         "elapsed": round((db.now() - started).total_seconds()),
     }
 
@@ -336,6 +338,21 @@ def api_preview(jid: str, n: int):
     return FileResponse(piece, media_type="audio/mpeg")
 
 
+@app.get("/api/source/{jid}")
+def api_source(jid: str):
+    """The downloaded source, served in byte ranges.
+
+    Once the full video is here, watching a moment is a seek rather than a
+    render: the browser asks for the bytes around it and nothing has to be
+    cut first.
+    """
+    with db.session() as s:
+        job = s.get(db.Job, jid)
+    if not job or not job.video_path or not Path(job.video_path).exists():
+        raise HTTPException(404, "The video for this run is not downloaded.")
+    return FileResponse(job.video_path, media_type="video/mp4")
+
+
 @app.get("/api/clip/{jid}/{n}")
 def api_clip(jid: str, n: int):
     """The rendered file: from disk where it still is, otherwise from storage."""
@@ -396,6 +413,20 @@ def api_reveal():
 @app.exception_handler(HTTPException)
 def http_error(request, exc):
     return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
+
+
+@app.middleware("http")
+async def fresh_dashboard(request, call_next):
+    """Make the browser check the dashboard files every load.
+
+    This app updates underneath itself, and a cached app.js after an update
+    looks exactly like a feature that silently does not work. The files still
+    carry an ETag, so revalidating usually costs a 304 and no bytes.
+    """
+    res = await call_next(request)
+    if request.url.path in ("/", "/index.html", "/app.js", "/styles.css"):
+        res.headers["Cache-Control"] = "no-cache"
+    return res
 
 
 app.mount("/", StaticFiles(directory=STATIC, html=True), name="static")

@@ -680,27 +680,41 @@ def _call_openai_compatible(prompt, api_key, model, base_url):
         raise RuntimeError("The scoring API sent back an unexpected response.")
 
 
-HOOK_CARD_WORDS = 6
+# The prompt asks for three to six words. The character budget is what the
+# frame actually enforces: past this the card runs to a third line and
+# covers the face. The word cap is only a guard against a rambling answer.
+HOOK_CARD_WORDS = 8
 HOOK_CARD_CHARS = 38
 
 
-def _hook_card(clip):
-    """The written hook, trimmed to something that fits across the top.
+def _trim_card(text):
+    """Cut a hook down to size, or give up and say so.
 
-    Models pad these out given half a chance, and a card that wraps to three
-    lines covers the speaker's face, so the length is enforced here rather
-    than hoped for in the prompt.
+    Dropping the last word off a line the model wrote too long leaves a
+    dangling phrase on screen: "He has to shoot from way" is worse than no
+    card at all. So a line that only fits by losing a word is refused, and
+    the caller falls back to the title, which is already short and whole.
     """
-    text = (clip.get("hook_card") or clip.get("title") or "").strip()
-    text = re.sub(r"\s+", " ", text.strip(" \"'`*#.,!?-"))
+    text = re.sub(r"\s+", " ", (text or "").strip(" \"'`*#.,!?-"))
     if not text:
         return ""
-    words = text.split()[:HOOK_CARD_WORDS]
-    out = " ".join(words)
-    while len(out) > HOOK_CARD_CHARS and len(words) > 2:
-        words.pop()
-        out = " ".join(words)
-    return out[:HOOK_CARD_CHARS].strip()
+    words = text.split()
+    if len(words) > HOOK_CARD_WORDS or len(text) > HOOK_CARD_CHARS:
+        # Unless it breaks cleanly at punctuation the model put there itself.
+        head = re.split(r"[,;:.!?]", text)[0].strip()
+        if (head and head != text and len(head.split()) >= 3
+                and len(head.split()) <= HOOK_CARD_WORDS
+                and len(head) <= HOOK_CARD_CHARS):
+            return head
+        return ""
+    return text
+
+
+def _hook_card(clip):
+    """The written hook, or the title when the model would not keep it short."""
+    return (_trim_card(clip.get("hook_card"))
+            or _trim_card(clip.get("title"))
+            or "")
 
 
 def score_moments(segments, provider, api_key, clip_len, max_clips, progress, url=""):
